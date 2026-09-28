@@ -2,7 +2,12 @@
 Email Guard — analyse untrusted emails / documents behind layered guardrails.
 Tiny stdlib-only HTTP server.
 
-    python3 server/app.py            # listens on 127.0.0.1:8787
+    python3 server/app.py            # listens on 127.0.0.1:3305
+
+Production: `npm run build`, then the same server also serves the built site
+from dist/ (SPA fallback to index.html), so one process covers the whole app:
+
+    CHAT_PORT=3304 python3 server/app.py
 
 Endpoints (proxied by Vite under /api):
     POST /api/analyze  {"instruction": "...", "document": "..."}   untrusted email / document
@@ -17,10 +22,13 @@ guarded replies — the client cannot inject fake assistant turns.
 from __future__ import annotations
 
 import json
+import mimetypes
 import os
+import shutil
 import re
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -51,6 +59,9 @@ from doc_guard import (
 )
 
 HERE = Path(__file__).resolve().parent
+DIST = (HERE.parent / "dist").resolve()
+mimetypes.add_type("model/gltf-binary", ".glb")
+mimetypes.add_type("text/javascript", ".js")
 
 
 def load_env(path: Path) -> None:
@@ -71,7 +82,7 @@ API_KEY = os.environ.get("OLLAMA_API_KEY", "").strip()
 BASE_URL = os.environ.get("OLLAMA_BASE_URL", "https://ollama.com/v1").rstrip("/")
 MODEL = os.environ.get("CHAT_MODEL", "gpt-oss:120b").strip()
 HOST = os.environ.get("CHAT_HOST", "127.0.0.1")
-PORT = int(os.environ.get("CHAT_PORT", "8787"))
+PORT = int(os.environ.get("CHAT_PORT", "3305"))
 DEFAULT_INSTRUCTION = "Tóm tắt email này, liệt kê việc cần làm và đánh giá rủi ro."
 
 limiter = RateLimiter(max_requests=int(os.environ.get("CHAT_RATE_LIMIT", "8")), window_seconds=60)
@@ -360,14 +371,46 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _static(self, head: bool = False) -> None:
+        """Serve the built site from dist/; unknown routes fall back to index.html (react-router)."""
+        path = urllib.parse.unquote(self.path.split("?", 1)[0].split("#", 1)[0])
+        target = (DIST / path.lstrip("/")).resolve()
+        if not target.is_relative_to(DIST):  # path traversal
+            return self._json(404, {"error": "not found"})
+        if target.is_dir():
+            target = target / "index.html"
+        if not target.is_file():
+            if Path(path).suffix:  # a missing asset, not a page route
+                return self._json(404, {"error": "not found"})
+            target = DIST / "index.html"
+            if not target.is_file():
+                return self._json(503, {"error": "site not built — run `npm run build`"})
+        self.send_response(200)
+        self.send_header("Content-Type", mimetypes.guess_type(target.name)[0] or "application/octet-stream")
+        self.send_header("Content-Length", str(target.stat().st_size))
+        # Vite fingerprints everything under /assets/, so those can be cached forever
+        immutable = target.parent == DIST / "assets"
+        self.send_header("Cache-Control", "public, max-age=31536000, immutable" if immutable else "no-cache")
+        self.end_headers()
+        if not head:
+            with target.open("rb") as f:
+                shutil.copyfileobj(f, self.wfile)
+
     def do_GET(self):
         if self.path == "/api/health":
             self._json(200, {"ok": True, "model": MODEL, "has_key": bool(API_KEY)})
         elif self.path == "/api/stats":
             self._json(200, {**monitor.snapshot(), "rate_limit": {
                 "max_requests": limiter.max_requests, "window_seconds": limiter.window_seconds}})
-        else:
+        elif self.path.startswith("/api/"):
             self._json(404, {"error": "not found"})
+        else:
+            self._static()
+
+    def do_HEAD(self):
+        if self.path.startswith("/api/"):
+            return self._json(405, {"error": "method not allowed"})
+        self._static(head=True)
 
     def do_POST(self):
         if self.path not in {"/api/analyze", "/api/action", "/api/chat"}:
@@ -377,8 +420,12 @@ class Handler(BaseHTTPRequestHandler):
             data = json.loads(self.rfile.read(length) or b"{}")
         except (ValueError, json.JSONDecodeError):
             return self._json(400, {"error": "invalid JSON"})
-        # Behind the Vite proxy the socket peer is localhost; prefer the forwarded address
-        client_id = (self.headers.get("X-Forwarded-For") or self.client_address[0]).split(",")[0].strip()
+        # Behind Cloudflare Tunnel / the Vite proxy the socket peer is localhost. Cloudflare sets
+        # CF-Connecting-IP itself; X-Forwarded-For's first hop is client-supplied, so it is only
+        # a fallback for local dev.
+        client_id = (self.headers.get("CF-Connecting-IP")
+                     or self.headers.get("X-Forwarded-For")
+                     or self.client_address[0]).split(",")[0].strip()
 
         if self.path == "/api/analyze":
             return self._json(200, handle_analyze(

@@ -40,7 +40,7 @@ sys.path.insert(0, str(HERE))
 from app import CHAT_SYSTEM_PROMPT  # noqa: E402  (only to detect prompt leaks)
 from guardrails import normalize_text  # noqa: E402
 
-BASE = "http://127.0.0.1:8787"
+BASE = "http://127.0.0.1:3305"
 
 # ============================================================
 # Leak / refusal detectors (independent of the server's own filters)

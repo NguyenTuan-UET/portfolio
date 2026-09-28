@@ -7,7 +7,7 @@ export default defineConfig({
   server: {
     // API Email Guard chạy riêng bằng Python (server/app.py), Vite chuyển tiếp /api sang đó
     proxy: {
-      "/api": { target: "http://127.0.0.1:8787", xfwd: true },
+      "/api": { target: "http://127.0.0.1:3305", xfwd: true },
     },
   },
 })

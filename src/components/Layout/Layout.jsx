@@ -1,5 +1,5 @@
-import { useEffect } from "react"
-import { NavLink, Outlet, useLocation } from "react-router-dom"
+import { useEffect, useState } from "react"
+import { NavLink, useLocation, useOutlet } from "react-router-dom"
 import Chat from "../../pages/Chat/Chat"
 import { CONTACTS, cvFile } from "../../data/profile"
 
@@ -37,10 +37,28 @@ const NAV_LINKS = [
 ]
 
 export default function Layout() {
-  const { pathname } = useLocation()
+  const location = useLocation()
+  const outlet = useOutlet()
+  // trang đang hiển thị thật sự — giữ nguyên trang cũ (kèm Outlet của nó) trong lúc mờ dần,
+  // chỉ chuyển sang trang mới sau khi trang cũ đã mờ hẳn (xem route-fade-inner bên dưới)
+  const [rendered, setRendered] = useState({ location, outlet })
+  const [leaving, setLeaving] = useState(false)
 
   // chuyển trang thì bắt đầu từ đầu trang mới, không giữ vị trí cuộn của trang trước
-  useEffect(() => scrollToTop(SCROLL_TO_TOP_MS), [pathname])
+  useEffect(() => scrollToTop(SCROLL_TO_TOP_MS), [location.pathname])
+
+  // Home có canvas 3D (Lanyard) nặng để dọn dẹp (Three.js/Rapier); nếu unmount ngay lập tức, canvas
+  // đó có thể lóe sáng một khung hình giữa lúc bị gỡ. Nên báo hiệu "leaving" để mờ dần trang cũ trước,
+  // rồi mới thật sự đổi sang Outlet của trang mới khi đã mờ hẳn (onTransitionEnd bên dưới).
+  useEffect(() => {
+    if (location.pathname !== rendered.location.pathname) setLeaving(true)
+  }, [location, rendered])
+
+  function handleFadeEnd(e) {
+    if (e.target !== e.currentTarget || e.propertyName !== "opacity" || !leaving) return
+    setRendered({ location, outlet })
+    setLeaving(false)
+  }
 
   return (
     <div className="site-shell">
@@ -58,9 +76,15 @@ export default function Layout() {
         </nav>
       </header>
 
-      {/* key theo đường dẫn để trang mới chạy lại hiệu ứng mờ dần khi xuất hiện */}
-      <div key={pathname} className="route-fade">
-        <Outlet />
+      <div className="route-fade">
+        {/* key theo đường dẫn để trang mới chạy lại hiệu ứng mờ dần khi xuất hiện */}
+        <div
+          key={rendered.location.pathname}
+          className={`route-fade-inner${leaving ? " is-leaving" : ""}`}
+          onTransitionEnd={handleFadeEnd}
+        >
+          {rendered.outlet}
+        </div>
       </div>
 
       <footer className="footer label">

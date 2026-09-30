@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react"
+import { useEffect, useLayoutEffect, useRef, useState } from "react"
 import { useLocation, useNavigate } from "react-router-dom"
 import chatAvatar from "../../assets/chat-avatar.png"
 
@@ -16,6 +16,22 @@ const CHAT_SUGGESTIONS = [
 ]
 
 const MAX_IMAGE_SIDE = 1280 // resize trước khi gửi để nhẹ payload, ảnh gốc không rời khỏi trình duyệt
+const POPUP_MARGIN = 12
+const LAUNCHER_MARGIN = 12
+
+function clampPopupPosition(x, y, popup) {
+  return {
+    x: Math.min(Math.max(POPUP_MARGIN, x), Math.max(POPUP_MARGIN, window.innerWidth - popup.offsetWidth - POPUP_MARGIN)),
+    y: Math.min(Math.max(POPUP_MARGIN, y), Math.max(POPUP_MARGIN, window.innerHeight - popup.offsetHeight - POPUP_MARGIN)),
+  }
+}
+
+function clampLauncherPosition(x, y, launcher) {
+  return {
+    x: Math.min(Math.max(LAUNCHER_MARGIN, x), window.innerWidth - launcher.offsetWidth - LAUNCHER_MARGIN),
+    y: Math.min(Math.max(LAUNCHER_MARGIN, y), window.innerHeight - launcher.offsetHeight - LAUNCHER_MARGIN),
+  }
+}
 
 // nén/resize ảnh ngay trên trình duyệt rồi mới đọc base64: ảnh chưa từng chạm ổ đĩa server
 function fileToImage(file) {
@@ -46,8 +62,13 @@ const newSessionId = () =>
 
 export default function Chat() {
   const [open, setOpen] = useState(false)
+  const [popupPosition, setPopupPosition] = useState(null)
+  const [launcherPosition, setLauncherPosition] = useState(null)
+  const [draggingLauncher, setDraggingLauncher] = useState(false)
   const launcherRef = useRef(null)
   const popupRef = useRef(null)
+  const dragRef = useRef(null)
+  const suppressClickRef = useRef(false)
   const location = useLocation()
   const navigate = useNavigate()
 
@@ -60,8 +81,100 @@ export default function Chat() {
   }, [location, navigate])
 
   useEffect(() => {
-    if (open) popupRef.current?.querySelector('input[aria-label="Tin nhắn"]')?.focus({ preventScroll: true })
+    if (!open) return
+    popupRef.current?.querySelector('input[aria-label="Tin nhắn"]')?.focus({ preventScroll: true })
   }, [open])
+
+  useLayoutEffect(() => {
+    if (!open || !launcherPosition) return
+    const popup = popupRef.current
+    const launcher = launcherRef.current
+    if (!popup || !launcher) return
+    const rect = launcher.getBoundingClientRect()
+    const opensToRight = rect.left + rect.width / 2 < window.innerWidth / 2
+    const x = opensToRight ? rect.right + POPUP_MARGIN : rect.left - popup.offsetWidth - POPUP_MARGIN
+    const y = rect.top + rect.height / 2 - popup.offsetHeight / 2
+    setPopupPosition(clampPopupPosition(x, y, popup))
+  }, [open, launcherPosition])
+
+  useEffect(() => {
+    let resizeFrame
+    function keepLauncherOnScreen() {
+      cancelAnimationFrame(resizeFrame)
+      resizeFrame = requestAnimationFrame(() => {
+        const launcher = launcherRef.current
+        setLauncherPosition((position) => {
+          if (!position || !launcher) return position
+          const clamped = clampLauncherPosition(position.x, position.y, launcher)
+          const side = position.side || (clamped.x + launcher.offsetWidth / 2 < window.innerWidth / 2 ? "left" : "right")
+          return {
+            x: side === "left" ? LAUNCHER_MARGIN : window.innerWidth - launcher.offsetWidth - LAUNCHER_MARGIN,
+            y: clamped.y,
+            side,
+          }
+        })
+      })
+    }
+    window.addEventListener("resize", keepLauncherOnScreen)
+    return () => {
+      cancelAnimationFrame(resizeFrame)
+      window.removeEventListener("resize", keepLauncherOnScreen)
+    }
+  }, [])
+
+  function startDraggingLauncher(event) {
+    if (event.button !== 0) return
+    const launcher = launcherRef.current
+    if (!launcher) return
+    const rect = launcher.getBoundingClientRect()
+    dragRef.current = {
+      pointerId: event.pointerId,
+      offsetX: event.clientX - rect.left,
+      offsetY: event.clientY - rect.top,
+      startX: event.clientX,
+      startY: event.clientY,
+      moved: false,
+    }
+    event.currentTarget.setPointerCapture(event.pointerId)
+    setDraggingLauncher(true)
+  }
+
+  function dragLauncher(event) {
+    const drag = dragRef.current
+    const launcher = launcherRef.current
+    if (!drag || !launcher || drag.pointerId !== event.pointerId) return
+    if (!drag.moved && Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) < 4) return
+    drag.moved = true
+    const position = clampLauncherPosition(event.clientX - drag.offsetX, event.clientY - drag.offsetY, launcher)
+    setLauncherPosition({
+      ...position,
+      side: position.x + launcher.offsetWidth / 2 < window.innerWidth / 2 ? "left" : "right",
+    })
+  }
+
+  function stopDraggingLauncher(event) {
+    const drag = dragRef.current
+    const launcher = launcherRef.current
+    if (!drag || !launcher || drag.pointerId !== event.pointerId) return
+    if (drag.moved && event.type !== "pointercancel") {
+      const position = clampLauncherPosition(event.clientX - drag.offsetX, event.clientY - drag.offsetY, launcher)
+      const side = position.x + launcher.offsetWidth / 2 < window.innerWidth / 2 ? "left" : "right"
+      setLauncherPosition({
+        x: side === "left" ? LAUNCHER_MARGIN : window.innerWidth - launcher.offsetWidth - LAUNCHER_MARGIN,
+        y: position.y,
+        side,
+      })
+      suppressClickRef.current = true
+      window.setTimeout(() => {
+        suppressClickRef.current = false
+      }, 0)
+    }
+    dragRef.current = null
+    setDraggingLauncher(false)
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId)
+    }
+  }
 
   function minimize() {
     setOpen(false)
@@ -103,6 +216,7 @@ export default function Chat() {
         aria-labelledby="chat-title"
         hidden={!open}
         ref={popupRef}
+        style={popupPosition ? { left: popupPosition.x, top: popupPosition.y, right: "auto", bottom: "auto" } : undefined}
         onKeyDown={(event) => {
           if (event.key === "Escape") {
             event.stopPropagation()
@@ -122,14 +236,25 @@ export default function Chat() {
       </section>
       <button
         type="button"
-        className="chat-launcher"
+        className={`chat-launcher${draggingLauncher ? " dragging" : ""}`}
         ref={launcherRef}
+        style={launcherPosition ? { left: launcherPosition.x, top: launcherPosition.y, right: "auto", bottom: "auto" } : undefined}
         aria-label={open ? "Thu nhỏ trò chuyện" : "Mở trợ lý trò chuyện"}
         aria-expanded={open}
         aria-controls="chat-popup"
-        onClick={() => open ? minimize() : setOpen(true)}
+        onPointerDown={startDraggingLauncher}
+        onPointerMove={dragLauncher}
+        onPointerUp={stopDraggingLauncher}
+        onPointerCancel={stopDraggingLauncher}
+        onClick={() => {
+          if (suppressClickRef.current) {
+            suppressClickRef.current = false
+            return
+          }
+          open ? minimize() : setOpen(true)
+        }}
       >
-        <img src={chatAvatar} alt="" />
+        <img src={chatAvatar} alt="" draggable="false" />
         <span className="chat-status" aria-hidden="true" />
       </button>
     </aside>

@@ -51,7 +51,6 @@ button.link:hover {
 
 .page {
   position: relative;
-  min-height: 100vh;
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -536,6 +535,9 @@ button.link {
 .chat-widget > * { pointer-events: auto; }
 
 .chat-popup {
+  position: fixed;
+  right: max(24px, env(safe-area-inset-right));
+  bottom: calc(max(24px, env(safe-area-inset-bottom)) + 74px);
   display: flex;
   flex-direction: column;
   width: min(390px, calc(100vw - 32px));
@@ -581,7 +583,9 @@ button.link {
 }
 
 .chat-launcher {
-  position: relative;
+  position: fixed;
+  right: max(24px, env(safe-area-inset-right));
+  bottom: max(24px, env(safe-area-inset-bottom));
   width: 62px;
   height: 62px;
   padding: 3px;
@@ -589,12 +593,15 @@ button.link {
   border-radius: 50%;
   background: #8bb2c5;
   box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
-  cursor: pointer;
-  transition: transform 0.2s;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  transition: left 0.25s ease, top 0.25s ease, transform 0.2s;
 }
 
-.chat-launcher:hover { transform: translateY(-3px); }
-.chat-launcher img { display: block; width: 100%; height: 100%; object-fit: cover; border-radius: 50%; }
+.chat-launcher:hover:not(.dragging) { transform: translateY(-3px); }
+.chat-launcher.dragging { cursor: grabbing; transition: none; transform: none; }
+.chat-launcher img { display: block; width: 100%; height: 100%; object-fit: cover; border-radius: 50%; -webkit-user-drag: none; }
 .chat-status { position: absolute; right: 2px; bottom: 2px; width: 13px; height: 13px; border: 2px solid #071d60; border-radius: 50%; background: #7ce7b0; }
 .chat-widget :focus-visible { outline: 2px solid #9fc4ff; outline-offset: -3px; }
 
@@ -843,7 +850,11 @@ button.link {
     right: max(16px, env(safe-area-inset-right));
     bottom: max(16px, env(safe-area-inset-bottom));
   }
-  .chat-popup { height: min(540px, calc(100dvh - 108px)); }
+  .chat-popup {
+    right: max(16px, env(safe-area-inset-right));
+    bottom: calc(max(16px, env(safe-area-inset-bottom)) + 68px);
+    height: min(540px, calc(100dvh - 108px));
+  }
   .chat-launcher { width: 56px; height: 56px; }
 }
 

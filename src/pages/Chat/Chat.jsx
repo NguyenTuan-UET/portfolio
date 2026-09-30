@@ -1,6 +1,8 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react"
 import { useLocation, useNavigate } from "react-router-dom"
 import chatAvatar from "../../assets/chat-avatar.png"
+import offlineArt from "../../assets/chat-offline.webp"
+import tiredArt from "../../assets/chat-tired.webp"
 import "./Chat.css"
 
 const LAYER_NAME = {
@@ -9,6 +11,14 @@ const LAYER_NAME = {
   llm_error: "Lỗi mô hình",
   output_guardrail: "Guardrail",
 }
+
+// lỗi không phải do guardrail chặn: hiện thẻ minh hoạ thay cho câu trả lời
+const STATUS_CARDS = {
+  offline: { art: offlineArt, text: "Server mất điện rồi, chưa kết nối được với trợ lý. Bạn thử lại sau nhé." },
+  tired: { art: tiredArt, text: "Em mệt quá, cho em nghỉ chút nhé." },
+}
+// giới hạn tốc độ của server và lỗi phía mô hình (hết quota, 429, không gửi được) đều là "mệt"
+const TIRED_LAYERS = new Set(["rate_limiter", "llm_error"])
 
 const CHAT_SUGGESTIONS = [
   "Làm sao tạo mật khẩu mạnh mà dễ nhớ?",
@@ -223,7 +233,7 @@ export default function Chat() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session_id: sessionId, message: msg, image: image?.base64 }),
       })
-      if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`)
+      if (!res.ok || !res.body) throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status })
       // Server-Sent Events: mỗi sự kiện là "data: {json}" và kết thúc bằng một dòng trống
       const reader = res.body.pipeThrough(new TextDecoderStream()).getReader()
       let buffer = ""
@@ -241,18 +251,20 @@ export default function Chat() {
           else if (event.type === "replace") apply(() => ({ text: event.text }))
           else if (event.type === "done") {
             // câu trả lời cuối đã qua đủ guardrail, luôn ghi đè phần đã stream
-            apply(() => ({ text: event.reply, blocked: event.blocked, redacted: event.redacted, layer: event.layer }))
+            if (TIRED_LAYERS.has(event.layer)) {
+              const wait = event.trace?.find((t) => t.layer === "rate_limiter")?.detail?.match(/\d+/)?.[0]
+              apply(() => ({ text: "", status: "tired", wait }))
+            } else {
+              apply(() => ({ text: event.reply, blocked: event.blocked, redacted: event.redacted, layer: event.layer }))
+            }
             done = true
           }
         }
       }
       if (!done) throw new Error("stream ended early")
-    } catch {
-      apply((m) => ({
-        text: m.text || "Hiện chưa kết nối được với trợ lý. Bạn thử lại sau nhé.",
-        blocked: !m.text,
-        layer: "network",
-      }))
+    } catch (error) {
+      // phần đã stream (nếu có) vẫn giữ lại, thẻ lỗi hiện ngay bên dưới
+      apply(() => ({ status: error.status === 429 ? "tired" : "offline" }))
     } finally {
       setLoading(false)
     }
@@ -359,7 +371,7 @@ function ChatPanel({ messages, loading, onSend, open }) {
         )}
         {messages.map((m, i) => (
           <li key={i} className={`${m.role}${m.blocked ? " blocked" : ""}`}>
-            {m.role === "bot" && m.layer && (
+            {m.role === "bot" && m.layer && !m.status && (
               <span className="chat-flag">
                 {m.blocked ? "BỊ CHẶN" : m.redacted ? "ĐÃ LÀM SẠCH" : "LỖI"} · {LAYER_NAME[m.layer] || m.layer}
               </span>
@@ -369,6 +381,15 @@ function ChatPanel({ messages, loading, onSend, open }) {
               <p>
                 <RichText text={m.text} />
               </p>
+            )}
+            {m.status && (
+              <figure className="chat-status-card">
+                <img src={STATUS_CARDS[m.status].art} alt="" />
+                <figcaption>
+                  {STATUS_CARDS[m.status].text}
+                  {m.wait && <small>Khoảng {m.wait} giây nữa em quay lại.</small>}
+                </figcaption>
+              </figure>
             )}
           </li>
         ))}

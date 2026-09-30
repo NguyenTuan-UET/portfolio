@@ -814,11 +814,28 @@ button.link {
   display: flex;
   flex-direction: column;
   min-height: 0;
-  animation: route-fade-in 0.45s ease-out;
 }
 
-.route-fade > * {
+/* Home có canvas 3D (Lanyard) nặng để dọn (Three.js/Rapier); unmount đột ngột khi rời trang hay bị
+   lóe sáng một khung hình do canvas gỡ ra giữa lúc còn đang render. Nên mờ dần trang cũ về opacity 0
+   TRƯỚC (Layout.jsx giữ nguyên nội dung cũ trong lúc này), chỉ unmount thật sự sau khi đã vô hình. */
+.route-fade-inner {
   flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  animation: route-fade-in 0.45s ease-out;
+  transition: opacity 0.2s ease;
+}
+
+.route-fade-inner > * {
+  flex: 1;
+}
+
+.route-fade-inner.is-leaving {
+  opacity: 0;
+  animation: none;
+  pointer-events: none;
 }
 
 @keyframes route-fade-in {
@@ -833,7 +850,7 @@ button.link {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .route-fade {
+  .route-fade-inner {
     animation: none;
   }
 }

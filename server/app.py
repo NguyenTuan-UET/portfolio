@@ -16,6 +16,8 @@ Endpoints (proxied by Vite under /api):
                        general chatbot, same guardrails; a message with an image uses the
                        vision model instead of the text one, and the image is only ever
                        forwarded to that one request — never written to disk or history
+    POST /api/chat/stream  same body; the reply streams as Server-Sent Events
+                       ({"type": "delta" | "replace" | "done", ...}), output guardrail applied as it streams
 
 Chat history lives on the server, keyed by session id, and only ever contains
 guarded replies — the client cannot inject fake assistant turns.
@@ -224,6 +226,72 @@ def call_vision_llm(messages: list[dict], image_b64: str) -> str:
     return (data.get("message", {}).get("content") or "").strip()
 
 
+def _http_error(e: urllib.error.HTTPError) -> RuntimeError:
+    return RuntimeError(f"HTTP {e.code}: {e.read()[:200].decode(errors='replace')}")
+
+
+def stream_llm(messages: list[dict], max_tokens: int = 2048):
+    """Same request as call_llm with stream=true; yields content deltas (reasoning deltas are skipped)."""
+    if not API_KEY:
+        raise RuntimeError("OLLAMA_API_KEY is not set (see server/.env.example)")
+    body = json.dumps({
+        "model": MODEL,
+        "messages": messages,
+        "temperature": 0.3,
+        "max_tokens": max_tokens,
+        "reasoning_effort": "low",
+        "stream": True,
+    }).encode()
+    req = urllib.request.Request(
+        f"{BASE_URL}/chat/completions",
+        data=body,
+        headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            for line in resp:  # SSE: "data: {...}" lines, terminated by "data: [DONE]"
+                line = line.decode("utf-8", errors="replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if payload == "[DONE]":
+                    return
+                choices = json.loads(payload).get("choices") or [{}]
+                delta = (choices[0].get("delta") or {}).get("content")
+                if delta:
+                    yield delta
+    except urllib.error.HTTPError as e:
+        raise _http_error(e) from e
+
+
+def stream_vision_llm(messages: list[dict], image_b64: str):
+    """Same request as call_vision_llm with stream=true (native API: one JSON object per line)."""
+    if not API_KEY:
+        raise RuntimeError("OLLAMA_API_KEY is not set (see server/.env.example)")
+    messages = [*messages[:-1], {**messages[-1], "images": [image_b64]}]
+    body = json.dumps({"model": VISION_MODEL, "messages": messages, "stream": True}).encode()
+    req = urllib.request.Request(
+        OLLAMA_NATIVE_URL,
+        data=body,
+        headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            for line in resp:
+                if not line.strip():
+                    continue
+                chunk = json.loads(line)
+                if chunk.get("error"):
+                    raise RuntimeError(str(chunk["error"])[:200])
+                delta = (chunk.get("message") or {}).get("content")
+                if delta:
+                    yield delta
+                if chunk.get("done"):
+                    return
+    except urllib.error.HTTPError as e:
+        raise _http_error(e) from e
+
+
 def handle_analyze(client_id: str, instruction: str, document: str) -> dict:
     """Analyse an untrusted email / document: scan → spotlight → LLM → schema + link guard → action gateway."""
     request_id = uuid.uuid4().hex[:12]
@@ -318,7 +386,46 @@ def handle_analyze(client_id: str, instruction: str, document: str) -> dict:
 
 
 def handle_chat(client_id: str, session_id: str, message: str, image_b64: str = "") -> dict:
+    """Non-streaming /api/chat: run the streaming pipeline to the end and return only the final result."""
+    for event in chat_events(client_id, session_id, message, image_b64):
+        pass
+    event.pop("type")
+    return event
+
+
+def _chat_precheck(client_id: str, message: str, image_b64: str, trace: list[dict]) -> tuple[str, str, str] | None:
+    """Steps before the LLM; return (layer, detail, reply) when the message is blocked."""
+    has_image = bool(image_b64)
+    # 1. Rate limiter — shared budget with the analyzer
+    decision, wait = limiter.check(client_id)
+    if decision == "BLOCK":
+        return ("rate_limiter", f"retry in {wait:.0f}s", block_message("rate_limiter", message, wait=f"{wait:.0f}"))
+    trace.append({"layer": "rate_limiter", "status": "pass"})
+
+    # 2. Input guardrail on the user's message (an image alone is allowed; a caption still is not)
+    if has_image and len(image_b64) > MAX_IMAGE_B64_CHARS:
+        return ("input_guardrail", "image_too_large", block_message("image_too_large", message))
+    if not message and not has_image:
+        return ("input_guardrail", "empty", "Bạn muốn hỏi gì?")
+    if len(message) > MAX_INPUT_CHARS:
+        return ("input_guardrail", "too_long", block_message("too_long", message))
+    if detect_injection(message) == "BLOCK":
+        return ("input_guardrail", "injection", block_message("injection", message))
+    if harmful_request(message) == "BLOCK":
+        return ("input_guardrail", "harmful_request", block_message("harmful_topic", message))
+    topic = restricted_topic(message)
+    if topic:
+        return ("input_guardrail", topic, block_message(topic, message))
+    trace.append({"layer": "input_guardrail", "status": "pass"})
+    return None
+
+
+def chat_events(client_id: str, session_id: str, message: str, image_b64: str = ""):
     """Guarded general chat: rate limit → input guardrail → LLM → output guardrail.
+
+    Yields {"type": "delta", "text"} while the reply streams, {"type": "replace", "text"} when
+    already-sent text must be rewritten, and always ends with {"type": "done", ...} carrying the
+    final guarded reply (the same dict /api/chat returns).
 
     Text-only messages go to the OSS chat model; a message with an attached image
     goes to the vision model instead. The image is only ever passed through to the
@@ -338,35 +445,18 @@ def handle_chat(client_id: str, session_id: str, message: str, image_b64: str = 
             blocked=result["blocked"], layer=result["layer"],
         )
         monitor.record(blocked=result["blocked"], redacted=result["redacted"], layer=result["layer"])
-        return result
+        return {"type": "done", **result}
 
     def block(layer: str, detail: str, reply: str) -> dict:
         trace.append({"layer": layer, "status": "block", "detail": detail})
         result.update(blocked=True, layer=layer, reply=reply)
         return finish()
 
-    # 1. Rate limiter — shared budget with the analyzer
-    decision, wait = limiter.check(client_id)
-    if decision == "BLOCK":
-        return block("rate_limiter", f"retry in {wait:.0f}s",
-                     block_message("rate_limiter", message, wait=f"{wait:.0f}"))
-    trace.append({"layer": "rate_limiter", "status": "pass"})
-
-    # 2. Input guardrail on the user's message (an image alone is allowed; a caption still is not)
-    if has_image and len(image_b64) > MAX_IMAGE_B64_CHARS:
-        return block("input_guardrail", "image_too_large", block_message("image_too_large", message))
-    if not message and not has_image:
-        return block("input_guardrail", "empty", "Bạn muốn hỏi gì?")
-    if len(message) > MAX_INPUT_CHARS:
-        return block("input_guardrail", "too_long", block_message("too_long", message))
-    if detect_injection(message) == "BLOCK":
-        return block("input_guardrail", "injection", block_message("injection", message))
-    if harmful_request(message) == "BLOCK":
-        return block("input_guardrail", "harmful_request", block_message("harmful_topic", message))
-    topic = restricted_topic(message)
-    if topic:
-        return block("input_guardrail", topic, block_message(topic, message))
-    trace.append({"layer": "input_guardrail", "status": "pass"})
+    # 1–2. Rate limiter and input guardrail
+    blocked = _chat_precheck(client_id, message, image_b64, trace)
+    if blocked:
+        yield block(*blocked)
+        return
 
     # 3. LLM with server-side history (only guarded, text-only turns are ever stored —
     #    an image attached to this turn is used once and discarded, never persisted)
@@ -374,28 +464,47 @@ def handle_chat(client_id: str, session_id: str, message: str, image_b64: str = 
         history = list(chat_sessions.get(session_id, []))
     user_text = message or DEFAULT_IMAGE_CAPTION
     used_model = VISION_MODEL if has_image else MODEL
+    messages = [{"role": "system", "content": CHAT_SYSTEM_PROMPT}, *history, {"role": "user", "content": user_text}]
+
+    # 4. Output guardrail — links only from the user's own messages (no hallucinated / phishing links),
+    #    no markdown images, no secrets. It runs on every chunk while streaming: text is released only
+    #    up to the last whitespace (a link or secret never contains one), after clean_text has run on
+    #    everything so far, so a redacted value is never sent — not even for a moment.
+    allowed: set[str] = set()
+    for turn in [*history, {"role": "user", "content": message}]:
+        if turn["role"] == "user":
+            allowed.update(u.rstrip(".,;:!?") for u in _URL.findall(turn["content"]))
+    raw = sent = ""
     try:
-        messages = [{"role": "system", "content": CHAT_SYSTEM_PROMPT}, *history, {"role": "user", "content": user_text}]
-        raw = call_vision_llm(messages, image_b64) if has_image else call_llm(messages, max_tokens=1024)
+        chunks = stream_vision_llm(messages, image_b64) if has_image else stream_llm(messages, max_tokens=1024)
+        for chunk in chunks:
+            raw += chunk
+            evidence = legal_content(raw)
+            if evidence:
+                # Fail closed: a reply that explains laws / fines is replaced, not trimmed — the model
+                # is cut off and any text already shown is swapped for the refusal
+                chunks.close()
+                trace.append({"layer": "llm", "status": "pass", "detail": used_model})
+                yield block("output_guardrail", f"legal_content ({evidence})", block_message("legal_advice", message))
+                return
+            cut = max(raw.rfind(" "), raw.rfind("\n"), raw.rfind("\t")) + 1
+            safe = clean_text(raw[:cut], allowed, [])
+            if safe.startswith(sent):
+                if len(safe) > len(sent):
+                    yield {"type": "delta", "text": safe[len(sent):]}
+            else:  # a pattern completed across already-sent text (e.g. a markdown image) — resend it all
+                yield {"type": "replace", "text": safe}
+            sent = safe
         trace.append({"layer": "llm", "status": "pass", "detail": used_model})
     except Exception as e:
         print(f"[chat] LLM error: {type(e).__name__}: {e}")
         trace.append({"layer": "llm", "status": "error", "detail": type(e).__name__})
         result.update(layer="llm_error", reply=block_message("llm_error", message))
-        return finish()
+        yield finish()
+        return
 
-    # 4. Output guardrail — links only from the user's own messages (no hallucinated / phishing links),
-    #    no markdown images, no secrets
-    allowed: set[str] = set()
-    for turn in [*history, {"role": "user", "content": message}]:
-        if turn["role"] == "user":
-            allowed.update(u.rstrip(".,;:!?") for u in _URL.findall(turn["content"]))
-    evidence = legal_content(raw)
-    if evidence:
-        # Fail closed: a reply that explains laws / fines is replaced, not trimmed
-        return block("output_guardrail", f"legal_content ({evidence})", block_message("legal_advice", message))
     issues: list[str] = []
-    reply = clean_text(raw, allowed, issues) or "…"
+    reply = clean_text(raw.strip(), allowed, issues) or "…"
     trace.append({"layer": "output_guardrail", "status": "redact" if issues else "pass",
                   "detail": "; ".join(issues) or None})
     result.update(reply=reply, redacted=bool(issues), layer="output_guardrail" if issues else None, model=used_model)
@@ -408,7 +517,7 @@ def handle_chat(client_id: str, session_id: str, message: str, image_b64: str = 
         chat_sessions[session_id] = turns[-CHAT_HISTORY_TURNS * 2:]
         while len(chat_sessions) > MAX_CHAT_SESSIONS:
             chat_sessions.pop(next(iter(chat_sessions)))
-    return finish()
+    yield finish()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -421,6 +530,21 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _stream(self, events) -> None:
+        """Server-Sent Events, one JSON event per message. text/event-stream is what Cloudflare passes
+        through unbuffered; X-Accel-Buffering stops nginx from holding the reply until it ends."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        try:
+            for event in events:
+                self.wfile.write(f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode())
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            events.close()  # the visitor closed the chat — stop the model too
 
     def _static(self, head: bool = False) -> None:
         """Serve the built site from dist/; unknown routes fall back to index.html (react-router)."""
@@ -464,10 +588,10 @@ class Handler(BaseHTTPRequestHandler):
         self._static(head=True)
 
     def do_POST(self):
-        if self.path not in {"/api/analyze", "/api/action", "/api/chat"}:
+        if self.path not in {"/api/analyze", "/api/action", "/api/chat", "/api/chat/stream"}:
             return self._json(404, {"error": "not found"})
         # /api/chat can carry a base64 image; other endpoints stay capped tight.
-        body_cap = MAX_IMAGE_B64_CHARS + 64_000 if self.path == "/api/chat" else 64_000
+        body_cap = MAX_IMAGE_B64_CHARS + 64_000 if self.path.startswith("/api/chat") else 64_000
         try:
             length = min(int(self.headers.get("Content-Length", 0)), body_cap)
             data = json.loads(self.rfile.read(length) or b"{}")
@@ -483,10 +607,12 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/analyze":
             return self._json(200, handle_analyze(
                 client_id, str(data.get("instruction", "")), str(data.get("document", ""))))
-        if self.path == "/api/chat":
-            return self._json(200, handle_chat(
-                client_id, str(data.get("session_id", ""))[:64] or "default", str(data.get("message", "")),
-                str(data.get("image", ""))))
+        if self.path.startswith("/api/chat"):
+            args = (client_id, str(data.get("session_id", ""))[:64] or "default", str(data.get("message", "")),
+                    str(data.get("image", "")))
+            if self.path == "/api/chat":
+                return self._json(200, handle_chat(*args))
+            return self._stream(chat_events(*args))
 
         row = gateway.resolve(str(data.get("action_id", "")), bool(data.get("approve")))
         if row is None:

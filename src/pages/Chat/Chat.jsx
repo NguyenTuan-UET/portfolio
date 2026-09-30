@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react"
 import { useLocation, useNavigate } from "react-router-dom"
 import chatAvatar from "../../assets/chat-avatar.png"
+import "./Chat.css"
 
 const LAYER_NAME = {
   rate_limiter: "Giới hạn tốc độ",
@@ -14,6 +15,20 @@ const CHAT_SUGGESTIONS = [
   "Giải thích prompt injection cho người mới",
   "Gợi ý lộ trình học Python 1 tháng",
 ]
+
+const Icon = ({ children }) => (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    {children}
+  </svg>
+)
+const MinusIcon = () => <Icon><path d="M6 12h12" /></Icon>
+const ArrowUpRightIcon = () => <Icon><path d="M7 17 17 7M8 7h9v9" /></Icon>
+const ArrowUpIcon = () => <Icon><path d="M12 19V5M6 11l6-6 6 6" /></Icon>
+const PaperclipIcon = () => (
+  <Icon>
+    <path d="m21 11-8.6 8.6a5.5 5.5 0 0 1-7.8-7.8l8.9-8.9a3.7 3.7 0 0 1 5.2 5.2l-8.9 8.9a1.8 1.8 0 0 1-2.6-2.6l8.3-8.3" />
+  </Icon>
+)
 
 const MAX_IMAGE_SIDE = 1280 // resize trước khi gửi để nhẹ payload, ảnh gốc không rời khỏi trình duyệt
 const POPUP_MARGIN = 12
@@ -191,17 +206,53 @@ export default function Chat() {
     const push = (m) => setMessages((prev) => [...prev, m])
     push({ role: "user", text: msg, imageUrl: image?.dataUrl })
     setLoading(true)
+    // tin nhắn bot được tạo ở sự kiện đầu tiên rồi cập nhật dần; chỉ có một câu trả lời chạy tại một thời điểm
+    let started = false
+    const apply = (patch) => {
+      const first = !started // đọc ngay lúc gọi, không đọc trong updater vì React có thể chạy updater sau
+      started = true
+      setMessages((prev) => {
+        if (first) return [...prev, { role: "bot", text: "", ...patch({ text: "" }) }]
+        const last = prev[prev.length - 1]
+        return [...prev.slice(0, -1), { ...last, ...patch(last) }]
+      })
+    }
     try {
-      const res = await fetch("/api/chat", {
+      const res = await fetch("/api/chat/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session_id: sessionId, message: msg, image: image?.base64 }),
       })
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const data = await res.json()
-      push({ role: "bot", text: data.reply, blocked: data.blocked, redacted: data.redacted, layer: data.layer })
+      if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`)
+      // Server-Sent Events: mỗi sự kiện là "data: {json}" và kết thúc bằng một dòng trống
+      const reader = res.body.pipeThrough(new TextDecoderStream()).getReader()
+      let buffer = ""
+      let done = false
+      while (!done) {
+        const chunk = await reader.read()
+        if (chunk.done) break
+        buffer += chunk.value
+        const events = buffer.split("\n\n")
+        buffer = events.pop()
+        for (const raw of events) {
+          if (!raw.startsWith("data:")) continue
+          const event = JSON.parse(raw.slice(5))
+          if (event.type === "delta") apply((m) => ({ text: m.text + event.text }))
+          else if (event.type === "replace") apply(() => ({ text: event.text }))
+          else if (event.type === "done") {
+            // câu trả lời cuối đã qua đủ guardrail, luôn ghi đè phần đã stream
+            apply(() => ({ text: event.reply, blocked: event.blocked, redacted: event.redacted, layer: event.layer }))
+            done = true
+          }
+        }
+      }
+      if (!done) throw new Error("stream ended early")
     } catch {
-      push({ role: "bot", text: "Hiện chưa kết nối được với trợ lý. Bạn thử lại sau nhé.", blocked: true, layer: "network" })
+      apply((m) => ({
+        text: m.text || "Hiện chưa kết nối được với trợ lý. Bạn thử lại sau nhé.",
+        blocked: !m.text,
+        layer: "network",
+      }))
     } finally {
       setLoading(false)
     }
@@ -226,11 +277,10 @@ export default function Chat() {
       >
         <header className="chat-head">
           <img src={chatAvatar} alt="" className="chat-avatar" />
-          <div>
-            <h2 id="chat-title">Trợ lý của bạn</h2>
-            <p>Hỏi mình điều gì nhé</p>
-          </div>
-          <button type="button" className="chat-minimize" onClick={minimize} aria-label="Thu nhỏ trò chuyện" title="Thu nhỏ">−</button>
+          <h2 id="chat-title">Trợ lý của bạn</h2>
+          <button type="button" className="chat-minimize" onClick={minimize} aria-label="Thu nhỏ trò chuyện" title="Thu nhỏ">
+            <MinusIcon />
+          </button>
         </header>
         <ChatPanel messages={messages} loading={loading} onSend={send} open={open} />
       </section>
@@ -255,7 +305,6 @@ export default function Chat() {
         }}
       >
         <img src={chatAvatar} alt="" draggable="false" />
-        <span className="chat-status" aria-hidden="true" />
       </button>
     </aside>
   )
@@ -269,7 +318,8 @@ function ChatPanel({ messages, loading, onSend, open }) {
   const fileRef = useRef(null)
 
   useEffect(() => {
-    listRef.current?.scrollTo({ top: listRef.current.scrollHeight, behavior: "smooth" })
+    // đang stream thì cuộn tức thì: cuộn mượt theo từng token sẽ giật
+    listRef.current?.scrollTo({ top: listRef.current.scrollHeight, behavior: loading ? "auto" : "smooth" })
   }, [messages, loading, open])
 
   function submit(msg) {
@@ -298,12 +348,15 @@ function ChatPanel({ messages, loading, onSend, open }) {
   return (
     <div className="chat-panel">
       <ol className="chat-log" ref={listRef} role="log" aria-label="Lịch sử trò chuyện" aria-live="polite" aria-relevant="additions" aria-busy={loading}>
-        <li className="bot">
-          <p>
-            Chào bạn, mình là Guard Bot. Hỏi mình bất cứ điều gì — công nghệ, học tập, công việc, an toàn trên mạng —
-            hoặc đính kèm một ảnh (biển báo, ảnh chụp màn hình...) để mình phân tích giúp.
-          </p>
-        </li>
+        {messages.length === 0 && (
+          <li className="chat-welcome">
+            <span className="chat-orb" aria-hidden="true" />
+            <p>
+              <strong>Chào bạn.</strong>
+              Bạn muốn tìm hiểu điều gì?
+            </p>
+          </li>
+        )}
         {messages.map((m, i) => (
           <li key={i} className={`${m.role}${m.blocked ? " blocked" : ""}`}>
             {m.role === "bot" && m.layer && (
@@ -319,7 +372,7 @@ function ChatPanel({ messages, loading, onSend, open }) {
             )}
           </li>
         ))}
-        {loading && (
+        {loading && messages[messages.length - 1]?.role !== "bot" && (
           <li className="bot">
             <p className="chat-typing">
               <span />
@@ -336,6 +389,7 @@ function ChatPanel({ messages, loading, onSend, open }) {
             <li key={s}>
               <button type="button" onClick={() => submit(s)} disabled={loading}>
                 {s}
+                <ArrowUpRightIcon />
               </button>
             </li>
           ))}
@@ -372,7 +426,7 @@ function ChatPanel({ messages, loading, onSend, open }) {
           aria-label="Đính kèm ảnh"
           title="Đính kèm ảnh"
         >
-          📎
+          <PaperclipIcon />
         </button>
         <input
           value={input}
@@ -381,8 +435,8 @@ function ChatPanel({ messages, loading, onSend, open }) {
           maxLength={1500}
           aria-label="Tin nhắn"
         />
-        <button type="submit" disabled={loading || (!input.trim() && !image)}>
-          GỬI
+        <button type="submit" disabled={loading || (!input.trim() && !image)} aria-label="Gửi" title="Gửi">
+          <ArrowUpIcon />
         </button>
       </form>
     </div>

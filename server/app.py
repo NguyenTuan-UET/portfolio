@@ -12,7 +12,10 @@ from dist/ (SPA fallback to index.html), so one process covers the whole app:
 Endpoints (proxied by Vite under /api):
     POST /api/analyze  {"instruction": "...", "document": "..."}   untrusted email / document
     POST /api/action   {"action_id": "...", "approve": true|false} human-in-the-loop decision
-    POST /api/chat     {"session_id": "...", "message": "..."}   general chatbot, same guardrails
+    POST /api/chat     {"session_id": "...", "message": "...", "image": "<base64, optional>"}
+                       general chatbot, same guardrails; a message with an image uses the
+                       vision model instead of the text one, and the image is only ever
+                       forwarded to that one request — never written to disk or history
 
 Chat history lives on the server, keyed by session id, and only ever contains
 guarded replies — the client cannot inject fake assistant turns.
@@ -81,9 +84,16 @@ load_env(HERE / ".env")
 API_KEY = os.environ.get("OLLAMA_API_KEY", "").strip()
 BASE_URL = os.environ.get("OLLAMA_BASE_URL", "https://ollama.com/v1").rstrip("/")
 MODEL = os.environ.get("CHAT_MODEL", "gpt-oss:120b").strip()
+# Native Ollama Cloud API (not the OpenAI-compatible /v1 surface) — needed for the
+# `images` field on a chat message, which the vision model reads.
+OLLAMA_NATIVE_URL = re.sub(r"/v1$", "", BASE_URL) + "/api/chat"
+VISION_MODEL = os.environ.get("VISION_MODEL", "gemma4:31b").strip()
 HOST = os.environ.get("CHAT_HOST", "127.0.0.1")
 PORT = int(os.environ.get("CHAT_PORT", "3305"))
 DEFAULT_INSTRUCTION = "Tóm tắt email này, liệt kê việc cần làm và đánh giá rủi ro."
+DEFAULT_IMAGE_CAPTION = "Mô tả và phân tích hình ảnh này."
+# Base64 length cap on the *encoded* image (~5.5MB raw at base64's 4/3 blowup).
+MAX_IMAGE_B64_CHARS = 7_500_000
 
 limiter = RateLimiter(max_requests=int(os.environ.get("CHAT_RATE_LIMIT", "8")), window_seconds=60)
 audit = AuditLog(HERE / "logs" / "audit.jsonl")
@@ -151,6 +161,10 @@ BLOCK_MESSAGES = {
         "Mô hình đang tạm thời không phản hồi, bạn thử lại sau nhé.",
         "The model is temporarily unavailable, please try again later.",
     ),
+    "image_too_large": (
+        "Ảnh quá lớn — hãy thử ảnh nhỏ hơn (khoảng dưới 5MB).",
+        "Image is too large — please try a smaller one (under ~5MB).",
+    ),
     "bad_schema": (
         "Kết quả của mô hình không đúng định dạng an toàn nên đã bị loại. Hãy thử lại.",
         "The model's answer did not match the safe schema and was discarded. Please retry.",
@@ -185,6 +199,29 @@ def call_llm(messages: list[dict], max_tokens: int = 2048) -> str:
     except urllib.error.HTTPError as e:
         raise RuntimeError(f"HTTP {e.code}: {e.read()[:200].decode(errors='replace')}") from e
     return (data["choices"][0]["message"].get("content") or "").strip()
+
+
+def call_vision_llm(messages: list[dict], image_b64: str) -> str:
+    """Native Ollama Cloud /api/chat, with the image attached to the last user turn.
+
+    The image bytes only ever live in this request body — they are never written
+    to the audit log, chat history or disk.
+    """
+    if not API_KEY:
+        raise RuntimeError("OLLAMA_API_KEY is not set (see server/.env.example)")
+    messages = [*messages[:-1], {**messages[-1], "images": [image_b64]}]
+    body = json.dumps({"model": VISION_MODEL, "messages": messages, "stream": False}).encode()
+    req = urllib.request.Request(
+        OLLAMA_NATIVE_URL,
+        data=body,
+        headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"HTTP {e.code}: {e.read()[:200].decode(errors='replace')}") from e
+    return (data.get("message", {}).get("content") or "").strip()
 
 
 def handle_analyze(client_id: str, instruction: str, document: str) -> dict:
@@ -280,17 +317,25 @@ def handle_analyze(client_id: str, instruction: str, document: str) -> dict:
     return finish("action_gateway" if blocked_actions else None, redacted=bool(issues or quarantined))
 
 
-def handle_chat(client_id: str, session_id: str, message: str) -> dict:
-    """Guarded general chat: rate limit → input guardrail → LLM → output guardrail."""
+def handle_chat(client_id: str, session_id: str, message: str, image_b64: str = "") -> dict:
+    """Guarded general chat: rate limit → input guardrail → LLM → output guardrail.
+
+    Text-only messages go to the OSS chat model; a message with an attached image
+    goes to the vision model instead. The image is only ever passed through to the
+    LLM request — it is never written to the chat history, the audit log or disk,
+    so nothing image-related is retained server-side.
+    """
     request_id = uuid.uuid4().hex[:12]
     message = message.strip()
+    has_image = bool(image_b64)
     trace: list[dict] = []
     result: dict = {"trace": trace, "blocked": False, "redacted": False, "layer": None}
 
     def finish() -> dict:
         audit.record(
-            request_id=request_id, client=anonymize(client_id), kind="chat", input=message[:300],
-            output=result.get("reply", "")[:300], blocked=result["blocked"], layer=result["layer"],
+            request_id=request_id, client=anonymize(client_id), kind="chat_image" if has_image else "chat",
+            input=message[:300], output=result.get("reply", "")[:300],
+            blocked=result["blocked"], layer=result["layer"],
         )
         monitor.record(blocked=result["blocked"], redacted=result["redacted"], layer=result["layer"])
         return result
@@ -307,8 +352,10 @@ def handle_chat(client_id: str, session_id: str, message: str) -> dict:
                      block_message("rate_limiter", message, wait=f"{wait:.0f}"))
     trace.append({"layer": "rate_limiter", "status": "pass"})
 
-    # 2. Input guardrail on the user's message
-    if not message:
+    # 2. Input guardrail on the user's message (an image alone is allowed; a caption still is not)
+    if has_image and len(image_b64) > MAX_IMAGE_B64_CHARS:
+        return block("input_guardrail", "image_too_large", block_message("image_too_large", message))
+    if not message and not has_image:
         return block("input_guardrail", "empty", "Bạn muốn hỏi gì?")
     if len(message) > MAX_INPUT_CHARS:
         return block("input_guardrail", "too_long", block_message("too_long", message))
@@ -321,13 +368,16 @@ def handle_chat(client_id: str, session_id: str, message: str) -> dict:
         return block("input_guardrail", topic, block_message(topic, message))
     trace.append({"layer": "input_guardrail", "status": "pass"})
 
-    # 3. LLM with server-side history (only guarded replies are ever stored)
+    # 3. LLM with server-side history (only guarded, text-only turns are ever stored —
+    #    an image attached to this turn is used once and discarded, never persisted)
     with chat_lock:
         history = list(chat_sessions.get(session_id, []))
+    user_text = message or DEFAULT_IMAGE_CAPTION
+    used_model = VISION_MODEL if has_image else MODEL
     try:
-        messages = [{"role": "system", "content": CHAT_SYSTEM_PROMPT}, *history, {"role": "user", "content": message}]
-        raw = call_llm(messages, max_tokens=1024)
-        trace.append({"layer": "llm", "status": "pass", "detail": MODEL})
+        messages = [{"role": "system", "content": CHAT_SYSTEM_PROMPT}, *history, {"role": "user", "content": user_text}]
+        raw = call_vision_llm(messages, image_b64) if has_image else call_llm(messages, max_tokens=1024)
+        trace.append({"layer": "llm", "status": "pass", "detail": used_model})
     except Exception as e:
         print(f"[chat] LLM error: {type(e).__name__}: {e}")
         trace.append({"layer": "llm", "status": "error", "detail": type(e).__name__})
@@ -348,12 +398,13 @@ def handle_chat(client_id: str, session_id: str, message: str) -> dict:
     reply = clean_text(raw, allowed, issues) or "…"
     trace.append({"layer": "output_guardrail", "status": "redact" if issues else "pass",
                   "detail": "; ".join(issues) or None})
-    result.update(reply=reply, redacted=bool(issues), layer="output_guardrail" if issues else None)
+    result.update(reply=reply, redacted=bool(issues), layer="output_guardrail" if issues else None, model=used_model)
 
-    # Only the guarded reply enters history, so a stripped link can never be replayed
+    # Only the guarded reply enters history, so a stripped link can never be replayed.
+    # The turn's text stands in for an attached image — the image itself never enters history.
     with chat_lock:
         turns = chat_sessions.pop(session_id, [])
-        turns += [{"role": "user", "content": message}, {"role": "assistant", "content": reply}]
+        turns += [{"role": "user", "content": user_text}, {"role": "assistant", "content": reply}]
         chat_sessions[session_id] = turns[-CHAT_HISTORY_TURNS * 2:]
         while len(chat_sessions) > MAX_CHAT_SESSIONS:
             chat_sessions.pop(next(iter(chat_sessions)))
@@ -398,7 +449,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/api/health":
-            self._json(200, {"ok": True, "model": MODEL, "has_key": bool(API_KEY)})
+            self._json(200, {"ok": True, "model": MODEL, "vision_model": VISION_MODEL, "has_key": bool(API_KEY)})
         elif self.path == "/api/stats":
             self._json(200, {**monitor.snapshot(), "rate_limit": {
                 "max_requests": limiter.max_requests, "window_seconds": limiter.window_seconds}})
@@ -415,8 +466,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path not in {"/api/analyze", "/api/action", "/api/chat"}:
             return self._json(404, {"error": "not found"})
+        # /api/chat can carry a base64 image; other endpoints stay capped tight.
+        body_cap = MAX_IMAGE_B64_CHARS + 64_000 if self.path == "/api/chat" else 64_000
         try:
-            length = min(int(self.headers.get("Content-Length", 0)), 64_000)
+            length = min(int(self.headers.get("Content-Length", 0)), body_cap)
             data = json.loads(self.rfile.read(length) or b"{}")
         except (ValueError, json.JSONDecodeError):
             return self._json(400, {"error": "invalid JSON"})
@@ -432,7 +485,8 @@ class Handler(BaseHTTPRequestHandler):
                 client_id, str(data.get("instruction", "")), str(data.get("document", ""))))
         if self.path == "/api/chat":
             return self._json(200, handle_chat(
-                client_id, str(data.get("session_id", ""))[:64] or "default", str(data.get("message", ""))))
+                client_id, str(data.get("session_id", ""))[:64] or "default", str(data.get("message", "")),
+                str(data.get("image", ""))))
 
         row = gateway.resolve(str(data.get("action_id", "")), bool(data.get("approve")))
         if row is None:

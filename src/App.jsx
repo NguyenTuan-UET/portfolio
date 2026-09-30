@@ -2,7 +2,7 @@ import { BrowserRouter, Routes, Route } from "react-router-dom"
 import Layout from "./components/Layout/Layout"
 import Home from "./pages/Home/Home"
 import About from "./pages/About/About"
-import EmailGuard from "./pages/EmailGuard/EmailGuard"
+import Chat from "./pages/Chat/Chat"
 import "./App.css"
 
 export default function App() {
@@ -12,7 +12,7 @@ export default function App() {
         <Route element={<Layout />}>
           <Route index element={<Home />} />
           <Route path="about" element={<About />} />
-          <Route path="email-guard" element={<EmailGuard />} />
+          <Route path="chat" element={<Chat />} />
         </Route>
       </Routes>
     </BrowserRouter>

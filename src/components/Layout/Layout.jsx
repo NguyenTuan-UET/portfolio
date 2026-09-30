@@ -33,7 +33,7 @@ function scrollToTop(duration) {
 const NAV_LINKS = [
   { to: "/", label: "HOME" },
   { to: "/about", label: "ABOUT" },
-  { to: "/email-guard", label: "EMAIL GUARD" },
+  { to: "/chat", label: "CHAT" },
 ]
 
 export default function Layout() {
@@ -42,13 +42,8 @@ export default function Layout() {
   // chuyển trang thì bắt đầu từ đầu trang mới, không giữ vị trí cuộn của trang trước
   useEffect(() => scrollToTop(SCROLL_TO_TOP_MS), [pathname])
 
-  // trang Email Guard dùng nền giấy sáng; header / footer đổi theo qua biến màu trên body
-  useEffect(() => {
-    document.body.classList.toggle("theme-paper", pathname === "/email-guard")
-  }, [pathname])
-
   return (
-    <>
+    <div className="site-shell">
       <header className="header">
         <span className="label header-date">3 March 2004, Ha Noi</span>
         <nav className="header-nav label">
@@ -84,6 +79,6 @@ export default function Layout() {
           ))}
         </div>
       </footer>
-    </>
+    </div>
   )
 }

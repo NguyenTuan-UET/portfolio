@@ -1,0 +1,10 @@
+# NeMo Guardrails config for Guard Bot. Only input/output rails are used, and every check is a
+# Python action from rails.py (the rules in guardrails.py), so NeMo makes no LLM calls of its own:
+# the chat model is still called directly by app.py, which is what lets the reply stream.
+rails:
+  input:
+    flows:
+      - check user message
+  output:
+    flows:
+      - check bot message

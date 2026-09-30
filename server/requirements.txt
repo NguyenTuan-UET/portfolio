@@ -1,0 +1,2 @@
+# Chatbot API. Install into a venv:  python3 -m venv server/.venv && server/.venv/bin/pip install -r server/requirements.txt
+nemoguardrails==0.24.1

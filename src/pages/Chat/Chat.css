@@ -130,8 +130,8 @@
 .chat-orb::after { content: ""; position: absolute; inset: 2px; border-radius: 50%; background: radial-gradient(ellipse at 58% 83%, #ffffff5e, transparent 48%); }
 .chat-log .chat-welcome p { padding: 0; border: 0; background: none; color: #77787a; font-size: 14px; line-height: 1.7; }
 .chat-welcome strong { display: block; margin-bottom: 4px; color: #202123; font-size: 30px; font-weight: 550; line-height: 1.3; letter-spacing: -0.055em; }
-.chat-status-card { display: flex; flex-direction: column; gap: 10px; width: min(220px, 100%); margin: 0; }
-.chat-status-card img { display: block; width: 100%; height: auto; border-radius: 18px; }
+.chat-status-card { display: flex; flex-direction: column; gap: 10px; margin: 0; }
+.chat-status-card img { display: block; width: min(200px, 100%); height: auto; border-radius: 18px; }
 .chat-status-card figcaption { color: #202123; font-size: 14px; line-height: 1.6; }
 .chat-status-card small { display: block; margin-top: 2px; color: #77787a; font-size: 12px; }
 .chat-log code { padding: 1px 4px; border-radius: 4px; background: #e9e9e5; font: 11px var(--mono); }

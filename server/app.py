@@ -1,72 +1,36 @@
 """
-Email Guard — analyse untrusted emails / documents behind layered guardrails.
-Tiny stdlib-only HTTP server.
+Guard Bot API — the portfolio chatbot behind layered guardrails. Tiny HTTP server,
+content rails run through NeMo Guardrails (see rails.py).
 
-    python3 server/app.py            # listens on 127.0.0.1:3305
+    server/.venv/bin/python server/app.py     # listens on 127.0.0.1:3305
 
-Production: `npm run build`, then the same server also serves the built site
-from dist/ (SPA fallback to index.html), so one process covers the whole app:
-
-    CHAT_PORT=3304 python3 server/app.py
-
-Endpoints (proxied by Vite under /api):
-    POST /api/analyze  {"instruction": "...", "document": "..."}   untrusted email / document
-    POST /api/action   {"action_id": "...", "approve": true|false} human-in-the-loop decision
-    POST /api/chat     {"session_id": "...", "message": "...", "image": "<base64, optional>"}
-                       general chatbot, same guardrails; a message with an image uses the
-                       vision model instead of the text one, and the image is only ever
+Endpoints (proxied under /api by Vite in dev, by nginx in production):
+    POST /api/chat/stream  {"session_id": "...", "message": "...", "image": "<base64, optional>"}
+                       reply streamed as Server-Sent Events ({"type": "delta" | "replace" | "done", ...});
+                       a message with an image uses the vision model, and the image is only ever
                        forwarded to that one request — never written to disk or history
-    POST /api/chat/stream  same body; the reply streams as Server-Sent Events
-                       ({"type": "delta" | "replace" | "done", ...}), output guardrail applied as it streams
+    GET  /api/stats    monitoring counters
+    GET  /api/health   liveness only (nothing about the models is exposed)
 
 Chat history lives on the server, keyed by session id, and only ever contains
 guarded replies — the client cannot inject fake assistant turns.
-    GET  /api/stats    monitoring counters
-    GET  /api/health   liveness + model name
 """
 from __future__ import annotations
 
 import json
-import mimetypes
 import os
-import shutil
 import re
 import threading
+import time
 import urllib.error
-import urllib.parse
 import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from guardrails import (
-    MAX_INPUT_CHARS,
-    AuditLog,
-    Monitor,
-    RateLimiter,
-    anonymize,
-    detect_injection,
-    harmful_request,
-    legal_content,
-    restricted_topic,
-)
-from doc_guard import (
-    MAX_DOC_CHARS,
-    QUARANTINED_TYPES,
-    RISK_ORDER,
-    _URL,
-    ActionGateway,
-    build_messages,
-    clean_text,
-    guard_output,
-    parse_analysis,
-    scan_document,
-)
-
+from guardrails import MAX_INPUT_CHARS, URL_PATTERN, AuditLog, Monitor, RateLimiter, anonymize
+from rails import ContentRails
 HERE = Path(__file__).resolve().parent
-DIST = (HERE.parent / "dist").resolve()
-mimetypes.add_type("model/gltf-binary", ".glb")
-mimetypes.add_type("text/javascript", ".js")
 
 
 def load_env(path: Path) -> None:
@@ -92,15 +56,16 @@ OLLAMA_NATIVE_URL = re.sub(r"/v1$", "", BASE_URL) + "/api/chat"
 VISION_MODEL = os.environ.get("VISION_MODEL", "gemma4:31b").strip()
 HOST = os.environ.get("CHAT_HOST", "127.0.0.1")
 PORT = int(os.environ.get("CHAT_PORT", "3305"))
-DEFAULT_INSTRUCTION = "Tóm tắt email này, liệt kê việc cần làm và đánh giá rủi ro."
 DEFAULT_IMAGE_CAPTION = "Mô tả và phân tích hình ảnh này."
 # Base64 length cap on the *encoded* image (~5.5MB raw at base64's 4/3 blowup).
 MAX_IMAGE_B64_CHARS = 7_500_000
 
 limiter = RateLimiter(max_requests=int(os.environ.get("CHAT_RATE_LIMIT", "8")), window_seconds=60)
 audit = AuditLog(HERE / "logs" / "audit.jsonl")
-gateway = ActionGateway()
 monitor = Monitor()
+rails = ContentRails()
+# While streaming, the output rail runs at most this often (seconds); the final reply is always checked
+STREAM_CHECK_INTERVAL = 0.05
 
 CHAT_SYSTEM_PROMPT = """You are Guard Bot, a friendly general-purpose assistant on a portfolio website.
 Chat naturally and helpfully about everyday questions, technology, learning, work, and online safety.
@@ -133,13 +98,9 @@ BLOCK_MESSAGES = {
         "Bạn gửi hơi nhanh rồi — thử lại sau {wait}s nhé.",
         "You're sending requests too fast — please try again in {wait}s.",
     ),
-    "empty_document": (
-        "Hãy dán nội dung email / tài liệu cần phân tích.",
-        "Please paste the email / document to analyse.",
-    ),
     "too_long": (
-        f"Tài liệu tối đa {MAX_DOC_CHARS} ký tự, yêu cầu tối đa {MAX_INPUT_CHARS} ký tự.",
-        f"Document max {MAX_DOC_CHARS} characters, instruction max {MAX_INPUT_CHARS} characters.",
+        f"Tin nhắn tối đa {MAX_INPUT_CHARS} ký tự.",
+        f"Messages are limited to {MAX_INPUT_CHARS} characters.",
     ),
     "injection": (
         "Yêu cầu bị chặn: câu lệnh của bạn trông như đang cố vượt qua quy tắc của trợ lý.",
@@ -167,63 +128,12 @@ BLOCK_MESSAGES = {
         "Ảnh quá lớn — hãy thử ảnh nhỏ hơn (khoảng dưới 5MB).",
         "Image is too large — please try a smaller one (under ~5MB).",
     ),
-    "bad_schema": (
-        "Kết quả của mô hình không đúng định dạng an toàn nên đã bị loại. Hãy thử lại.",
-        "The model's answer did not match the safe schema and was discarded. Please retry.",
-    ),
 }
 
 
 def block_message(key: str, text: str, **fmt) -> str:
     vi, en = BLOCK_MESSAGES[key]
     return (vi if is_vietnamese(text) else en).format(**fmt)
-
-
-def call_llm(messages: list[dict], max_tokens: int = 2048) -> str:
-    """OpenAI-compatible chat completion on Ollama Cloud."""
-    if not API_KEY:
-        raise RuntimeError("OLLAMA_API_KEY is not set (see server/.env.example)")
-    body = json.dumps({
-        "model": MODEL,
-        "messages": messages,
-        "temperature": 0.3,
-        "max_tokens": max_tokens,
-        "reasoning_effort": "low",
-    }).encode()
-    req = urllib.request.Request(
-        f"{BASE_URL}/chat/completions",
-        data=body,
-        headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=90) as resp:
-            data = json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"HTTP {e.code}: {e.read()[:200].decode(errors='replace')}") from e
-    return (data["choices"][0]["message"].get("content") or "").strip()
-
-
-def call_vision_llm(messages: list[dict], image_b64: str) -> str:
-    """Native Ollama Cloud /api/chat, with the image attached to the last user turn.
-
-    The image bytes only ever live in this request body — they are never written
-    to the audit log, chat history or disk.
-    """
-    if not API_KEY:
-        raise RuntimeError("OLLAMA_API_KEY is not set (see server/.env.example)")
-    messages = [*messages[:-1], {**messages[-1], "images": [image_b64]}]
-    body = json.dumps({"model": VISION_MODEL, "messages": messages, "stream": False}).encode()
-    req = urllib.request.Request(
-        OLLAMA_NATIVE_URL,
-        data=body,
-        headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            data = json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"HTTP {e.code}: {e.read()[:200].decode(errors='replace')}") from e
-    return (data.get("message", {}).get("content") or "").strip()
 
 
 def _http_error(e: urllib.error.HTTPError) -> RuntimeError:
@@ -292,114 +202,14 @@ def stream_vision_llm(messages: list[dict], image_b64: str):
         raise _http_error(e) from e
 
 
-def handle_analyze(client_id: str, instruction: str, document: str) -> dict:
-    """Analyse an untrusted email / document: scan → spotlight → LLM → schema + link guard → action gateway."""
-    request_id = uuid.uuid4().hex[:12]
-    instruction = instruction.strip() or DEFAULT_INSTRUCTION
-    trace: list[dict] = []
-    result: dict = {"trace": trace, "blocked": False}
-
-    def finish(layer: str | None = None, blocked: bool = False, redacted: bool = False) -> dict:
-        result["blocked"] = blocked
-        audit.record(
-            request_id=request_id, client=anonymize(client_id), kind="analyze",
-            input=instruction[:200], document_chars=len(document), blocked=blocked, layer=layer,
-            findings=[f["type"] for f in result.get("findings", [])],
-            actions=[(a["type"], a["decision"]) for a in result.get("actions", [])],
-        )
-        monitor.record(blocked=blocked, redacted=redacted, layer=layer)
-        return result
-
+def _chat_precheck(client_id: str, message: str, image_b64: str, trace: list[dict]) -> tuple | None:
+    """Steps before the LLM; return (layer, detail, reply[, retry_after]) when the message is blocked."""
+    has_image = bool(image_b64)
     # 1. Rate limiter — per client
     decision, wait = limiter.check(client_id)
     if decision == "BLOCK":
-        trace.append({"layer": "rate_limiter", "status": "block", "detail": f"retry in {wait:.0f}s"})
-        result["message"] = block_message("rate_limiter", instruction, wait=f"{wait:.0f}")
-        return finish("rate_limiter", blocked=True)
-    trace.append({"layer": "rate_limiter", "status": "pass"})
-
-    # 2. Input guardrail on the USER's instruction (the document is checked separately)
-    reason = None
-    if not document.strip():
-        reason = "empty_document"
-    elif len(document) > MAX_DOC_CHARS or len(instruction) > MAX_INPUT_CHARS:
-        reason = "too_long"
-    elif detect_injection(instruction) == "BLOCK":
-        reason = "injection"
-    elif harmful_request(instruction) == "BLOCK":
-        reason = "harmful_topic"
-    elif restricted_topic(instruction):
-        reason = restricted_topic(instruction)
-    if reason:
-        trace.append({"layer": "input_guardrail", "status": "block", "detail": reason})
-        result["message"] = block_message(reason, instruction)
-        return finish("input_guardrail", blocked=True)
-    trace.append({"layer": "input_guardrail", "status": "pass"})
-
-    # 3. Document scanner — quarantine AI-directed text, strip hidden content, flag phishing signals
-    scan = scan_document(document)
-    result["findings"] = scan["findings"]
-    result["sanitized"] = scan["sanitized"]
-    scan_risk = max((RISK_ORDER[f["severity"]] for f in scan["findings"]), default=0)
-    quarantined = sum(f["type"] in QUARANTINED_TYPES for f in scan["findings"])
-    trace.append({
-        "layer": "document_scanner",
-        "status": "redact" if scan["findings"] else "pass",
-        "detail": f"{len(scan['findings'])} finding(s), {quarantined} quarantined" if scan["findings"] else None,
-    })
-
-    # 4. LLM on the spotlighted, sanitized document
-    try:
-        raw = call_llm(build_messages(instruction, scan["sanitized"]))
-        trace.append({"layer": "llm", "status": "pass", "detail": MODEL})
-    except Exception as e:
-        print(f"[analyze] LLM error: {type(e).__name__}: {e}")
-        trace.append({"layer": "llm", "status": "error", "detail": type(e).__name__})
-        result["message"] = block_message("llm_error", instruction)
-        return finish("llm_error")
-
-    # 5. Output guardrail — strict schema (fail closed), link allowlist, secret redaction
-    analysis = parse_analysis(raw)
-    if analysis is None:
-        trace.append({"layer": "output_guardrail", "status": "block", "detail": "response did not match the schema"})
-        result["message"] = block_message("bad_schema", instruction)
-        return finish("output_guardrail", blocked=True)
-    issues = guard_output(analysis, scan)
-    trace.append({"layer": "output_guardrail", "status": "redact" if issues else "pass",
-                  "detail": "; ".join(issues) or None})
-
-    # The scanner can only raise the model's risk level, never lower it
-    names = {v: k for k, v in RISK_ORDER.items()}
-    analysis["risk_level"] = names[max(RISK_ORDER[analysis["risk_level"]], scan_risk)]
-
-    # 6. Action gateway — deterministic policy, human approval for side effects
-    actions = gateway.register(analysis.pop("proposed_actions"), scan, doc_risky=scan_risk >= 1)
-    blocked_actions = sum(a["decision"] == "blocked" for a in actions)
-    pending = sum(a["decision"] == "approval" for a in actions)
-    trace.append({
-        "layer": "action_gateway",
-        "status": "block" if blocked_actions else ("redact" if pending else "pass"),
-        "detail": f"{blocked_actions} blocked, {pending} need approval" if actions else "no actions proposed",
-    })
-    result.update(analysis=analysis, actions=actions)
-    return finish("action_gateway" if blocked_actions else None, redacted=bool(issues or quarantined))
-
-
-def handle_chat(client_id: str, session_id: str, message: str, image_b64: str = "") -> dict:
-    """Non-streaming /api/chat: run the streaming pipeline to the end and return only the final result."""
-    for event in chat_events(client_id, session_id, message, image_b64):
-        pass
-    event.pop("type")
-    return event
-
-
-def _chat_precheck(client_id: str, message: str, image_b64: str, trace: list[dict]) -> tuple[str, str, str] | None:
-    """Steps before the LLM; return (layer, detail, reply) when the message is blocked."""
-    has_image = bool(image_b64)
-    # 1. Rate limiter — shared budget with the analyzer
-    decision, wait = limiter.check(client_id)
-    if decision == "BLOCK":
-        return ("rate_limiter", f"retry in {wait:.0f}s", block_message("rate_limiter", message, wait=f"{wait:.0f}"))
+        return ("rate_limiter", f"retry in {wait:.0f}s", block_message("rate_limiter", message, wait=f"{wait:.0f}"),
+                round(wait))
     trace.append({"layer": "rate_limiter", "status": "pass"})
 
     # 2. Input guardrail on the user's message (an image alone is allowed; a caption still is not)
@@ -407,15 +217,10 @@ def _chat_precheck(client_id: str, message: str, image_b64: str, trace: list[dic
         return ("input_guardrail", "image_too_large", block_message("image_too_large", message))
     if not message and not has_image:
         return ("input_guardrail", "empty", "Bạn muốn hỏi gì?")
-    if len(message) > MAX_INPUT_CHARS:
-        return ("input_guardrail", "too_long", block_message("too_long", message))
-    if detect_injection(message) == "BLOCK":
-        return ("input_guardrail", "injection", block_message("injection", message))
-    if harmful_request(message) == "BLOCK":
-        return ("input_guardrail", "harmful_request", block_message("harmful_topic", message))
-    topic = restricted_topic(message)
-    if topic:
-        return ("input_guardrail", topic, block_message(topic, message))
+    # Content checks run as a NeMo Guardrails input rail (rails.py)
+    reason = rails.check_input(message) if message else None
+    if reason:
+        return ("input_guardrail", reason, block_message(reason, message))
     trace.append({"layer": "input_guardrail", "status": "pass"})
     return None
 
@@ -425,7 +230,8 @@ def chat_events(client_id: str, session_id: str, message: str, image_b64: str = 
 
     Yields {"type": "delta", "text"} while the reply streams, {"type": "replace", "text"} when
     already-sent text must be rewritten, and always ends with {"type": "done", ...} carrying the
-    final guarded reply (the same dict /api/chat returns).
+    final guarded reply. Everything yielded goes to the browser, so it never names a model or
+    carries the trace — those only go to the audit log.
 
     Text-only messages go to the OSS chat model; a message with an attached image
     goes to the vision model instead. The image is only ever passed through to the
@@ -436,20 +242,22 @@ def chat_events(client_id: str, session_id: str, message: str, image_b64: str = 
     message = message.strip()
     has_image = bool(image_b64)
     trace: list[dict] = []
-    result: dict = {"trace": trace, "blocked": False, "redacted": False, "layer": None}
+    result: dict = {"blocked": False, "redacted": False, "layer": None}
 
     def finish() -> dict:
         audit.record(
             request_id=request_id, client=anonymize(client_id), kind="chat_image" if has_image else "chat",
             input=message[:300], output=result.get("reply", "")[:300],
-            blocked=result["blocked"], layer=result["layer"],
+            blocked=result["blocked"], layer=result["layer"], trace=trace,  # the llm step names the model
         )
         monitor.record(blocked=result["blocked"], redacted=result["redacted"], layer=result["layer"])
         return {"type": "done", **result}
 
-    def block(layer: str, detail: str, reply: str) -> dict:
+    def block(layer: str, detail: str, reply: str, retry_after: int | None = None) -> dict:
         trace.append({"layer": layer, "status": "block", "detail": detail})
         result.update(blocked=True, layer=layer, reply=reply)
+        if retry_after is not None:
+            result["retry_after"] = retry_after
         return finish()
 
     # 1–2. Rate limiter and input guardrail
@@ -466,20 +274,25 @@ def chat_events(client_id: str, session_id: str, message: str, image_b64: str = 
     used_model = VISION_MODEL if has_image else MODEL
     messages = [{"role": "system", "content": CHAT_SYSTEM_PROMPT}, *history, {"role": "user", "content": user_text}]
 
-    # 4. Output guardrail — links only from the user's own messages (no hallucinated / phishing links),
-    #    no markdown images, no secrets. It runs on every chunk while streaming: text is released only
-    #    up to the last whitespace (a link or secret never contains one), after clean_text has run on
-    #    everything so far, so a redacted value is never sent — not even for a moment.
+    # 4. Output guardrail (NeMo output rail) — no legal advice, links only from the user's own messages
+    #    (no hallucinated / phishing links), no markdown images, no secrets. It also runs while streaming:
+    #    text is released only up to the last whitespace (a link or secret never contains one), after the
+    #    rail has checked everything so far, so a redacted value is never sent — not even for a moment.
     allowed: set[str] = set()
     for turn in [*history, {"role": "user", "content": message}]:
         if turn["role"] == "user":
-            allowed.update(u.rstrip(".,;:!?") for u in _URL.findall(turn["content"]))
+            allowed.update(u.rstrip(".,;:!?") for u in URL_PATTERN.findall(turn["content"]))
     raw = sent = ""
+    checked_at = 0.0
     try:
         chunks = stream_vision_llm(messages, image_b64) if has_image else stream_llm(messages, max_tokens=1024)
         for chunk in chunks:
             raw += chunk
-            evidence = legal_content(raw)
+            cut = max(raw.rfind(" "), raw.rfind("\n"), raw.rfind("\t")) + 1
+            if cut <= len(sent) or time.monotonic() - checked_at < STREAM_CHECK_INTERVAL:
+                continue  # nothing new to release yet, or the rail ran a moment ago
+            checked_at = time.monotonic()
+            evidence, safe, _ = rails.check_output(raw[:cut], allowed)
             if evidence:
                 # Fail closed: a reply that explains laws / fines is replaced, not trimmed — the model
                 # is cut off and any text already shown is swapped for the refusal
@@ -487,8 +300,6 @@ def chat_events(client_id: str, session_id: str, message: str, image_b64: str = 
                 trace.append({"layer": "llm", "status": "pass", "detail": used_model})
                 yield block("output_guardrail", f"legal_content ({evidence})", block_message("legal_advice", message))
                 return
-            cut = max(raw.rfind(" "), raw.rfind("\n"), raw.rfind("\t")) + 1
-            safe = clean_text(raw[:cut], allowed, [])
             if safe.startswith(sent):
                 if len(safe) > len(sent):
                     yield {"type": "delta", "text": safe[len(sent):]}
@@ -503,11 +314,14 @@ def chat_events(client_id: str, session_id: str, message: str, image_b64: str = 
         yield finish()
         return
 
-    issues: list[str] = []
-    reply = clean_text(raw.strip(), allowed, issues) or "…"
+    evidence, reply, issues = rails.check_output(raw.strip(), allowed)
+    if evidence:
+        yield block("output_guardrail", f"legal_content ({evidence})", block_message("legal_advice", message))
+        return
+    reply = reply or "…"
     trace.append({"layer": "output_guardrail", "status": "redact" if issues else "pass",
                   "detail": "; ".join(issues) or None})
-    result.update(reply=reply, redacted=bool(issues), layer="output_guardrail" if issues else None, model=used_model)
+    result.update(reply=reply, redacted=bool(issues), layer="output_guardrail" if issues else None)
 
     # Only the guarded reply enters history, so a stripped link can never be replayed.
     # The turn's text stands in for an attached image — the image itself never enters history.
@@ -521,7 +335,7 @@ def chat_events(client_id: str, session_id: str, message: str, image_b64: str = 
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "EmailGuard/1.0"
+    server_version = "GuardBot/1.0"
 
     def _json(self, status: int, payload: dict) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode()
@@ -546,52 +360,19 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             events.close()  # the visitor closed the chat — stop the model too
 
-    def _static(self, head: bool = False) -> None:
-        """Serve the built site from dist/; unknown routes fall back to index.html (react-router)."""
-        path = urllib.parse.unquote(self.path.split("?", 1)[0].split("#", 1)[0])
-        target = (DIST / path.lstrip("/")).resolve()
-        if not target.is_relative_to(DIST):  # path traversal
-            return self._json(404, {"error": "not found"})
-        if target.is_dir():
-            target = target / "index.html"
-        if not target.is_file():
-            if Path(path).suffix:  # a missing asset, not a page route
-                return self._json(404, {"error": "not found"})
-            target = DIST / "index.html"
-            if not target.is_file():
-                return self._json(503, {"error": "site not built — run `npm run build`"})
-        self.send_response(200)
-        self.send_header("Content-Type", mimetypes.guess_type(target.name)[0] or "application/octet-stream")
-        self.send_header("Content-Length", str(target.stat().st_size))
-        # Vite fingerprints everything under /assets/, so those can be cached forever
-        immutable = target.parent == DIST / "assets"
-        self.send_header("Cache-Control", "public, max-age=31536000, immutable" if immutable else "no-cache")
-        self.end_headers()
-        if not head:
-            with target.open("rb") as f:
-                shutil.copyfileobj(f, self.wfile)
-
     def do_GET(self):
         if self.path == "/api/health":
-            self._json(200, {"ok": True, "model": MODEL, "vision_model": VISION_MODEL, "has_key": bool(API_KEY)})
+            self._json(200, {"ok": True})  # public: no model names or key status
         elif self.path == "/api/stats":
             self._json(200, {**monitor.snapshot(), "rate_limit": {
                 "max_requests": limiter.max_requests, "window_seconds": limiter.window_seconds}})
-        elif self.path.startswith("/api/"):
-            self._json(404, {"error": "not found"})
         else:
-            self._static()
-
-    def do_HEAD(self):
-        if self.path.startswith("/api/"):
-            return self._json(405, {"error": "method not allowed"})
-        self._static(head=True)
+            self._json(404, {"error": "not found"})
 
     def do_POST(self):
-        if self.path not in {"/api/analyze", "/api/action", "/api/chat", "/api/chat/stream"}:
+        if self.path != "/api/chat/stream":
             return self._json(404, {"error": "not found"})
-        # /api/chat can carry a base64 image; other endpoints stay capped tight.
-        body_cap = MAX_IMAGE_B64_CHARS + 64_000 if self.path.startswith("/api/chat") else 64_000
+        body_cap = MAX_IMAGE_B64_CHARS + 64_000  # the message can carry a base64 image
         try:
             length = min(int(self.headers.get("Content-Length", 0)), body_cap)
             data = json.loads(self.rfile.read(length) or b"{}")
@@ -604,29 +385,15 @@ class Handler(BaseHTTPRequestHandler):
                      or self.headers.get("X-Forwarded-For")
                      or self.client_address[0]).split(",")[0].strip()
 
-        if self.path == "/api/analyze":
-            return self._json(200, handle_analyze(
-                client_id, str(data.get("instruction", "")), str(data.get("document", ""))))
-        if self.path.startswith("/api/chat"):
-            args = (client_id, str(data.get("session_id", ""))[:64] or "default", str(data.get("message", "")),
-                    str(data.get("image", "")))
-            if self.path == "/api/chat":
-                return self._json(200, handle_chat(*args))
-            return self._stream(chat_events(*args))
-
-        row = gateway.resolve(str(data.get("action_id", "")), bool(data.get("approve")))
-        if row is None:
-            return self._json(404, {"error": "unknown or expired action"})
-        audit.record(client=anonymize(client_id), kind="action", action=row["type"],
-                     target=row["target"][:120], status=row["status"])
-        self._json(200, row)
+        self._stream(chat_events(client_id, str(data.get("session_id", ""))[:64] or "default",
+                                 str(data.get("message", "")), str(data.get("image", ""))))
 
     def log_message(self, fmt, *args):  # quieter console, no client addresses
-        print(f"[email-guard] {self.command} {self.path} -> {args[1] if len(args) > 1 else ''}")
+        print(f"[guard-bot] {self.command} {self.path} -> {args[1] if len(args) > 1 else ''}")
 
 
 if __name__ == "__main__":
     if not API_KEY:
         print("WARNING: OLLAMA_API_KEY missing — copy server/.env.example to server/.env")
-    print(f"Email Guard API on http://{HOST}:{PORT}  (model: {MODEL})")
+    print(f"Guard Bot API on http://{HOST}:{PORT}  (model: {MODEL})")
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()

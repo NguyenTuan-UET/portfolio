@@ -5,10 +5,9 @@ import offlineArt from "../../assets/chat-offline.webp"
 import tiredArt from "../../assets/chat-tired.webp"
 import "./Chat.css"
 
+// rate_limiter / llm_error không có ở đây: chúng hiện thẻ minh hoạ (STATUS_CARDS) thay cho nhãn
 const LAYER_NAME = {
-  rate_limiter: "Giới hạn tốc độ",
   input_guardrail: "Guardrail",
-  llm_error: "Lỗi mô hình",
   output_guardrail: "Guardrail",
 }
 
@@ -252,8 +251,7 @@ export default function Chat() {
           else if (event.type === "done") {
             // câu trả lời cuối đã qua đủ guardrail, luôn ghi đè phần đã stream
             if (TIRED_LAYERS.has(event.layer)) {
-              const wait = event.trace?.find((t) => t.layer === "rate_limiter")?.detail?.match(/\d+/)?.[0]
-              apply(() => ({ text: "", status: "tired", wait }))
+              apply(() => ({ text: "", status: "tired", wait: event.retry_after }))
             } else {
               apply(() => ({ text: event.reply, blocked: event.blocked, redacted: event.redacted, layer: event.layer }))
             }
@@ -289,7 +287,7 @@ export default function Chat() {
       >
         <header className="chat-head">
           <img src={chatAvatar} alt="" className="chat-avatar" />
-          <h2 id="chat-title">Trợ lý của bạn</h2>
+          <h2 id="chat-title">Đệ của Devtamin</h2>
           <button type="button" className="chat-minimize" onClick={minimize} aria-label="Thu nhỏ trò chuyện" title="Thu nhỏ">
             <MinusIcon />
           </button>
@@ -344,6 +342,18 @@ function ChatPanel({ messages, loading, onSend, open }) {
   async function onPickFile(e) {
     const file = e.target.files?.[0]
     e.target.value = ""
+    attachFile(file)
+  }
+
+  // dán ảnh (Ctrl+V ảnh chụp màn hình / ảnh đã copy) ở bất kỳ đâu trong khung chat; dán chữ thì giữ như thường
+  function onPaste(e) {
+    const file = [...(e.clipboardData?.files || [])].find((f) => f.type.startsWith("image/"))
+    if (!file || loading) return
+    e.preventDefault()
+    attachFile(file)
+  }
+
+  async function attachFile(file) {
     if (!file) return
     if (!file.type.startsWith("image/")) {
       setImageError("Chỉ nhận file ảnh.")
@@ -358,7 +368,7 @@ function ChatPanel({ messages, loading, onSend, open }) {
   }
 
   return (
-    <div className="chat-panel">
+    <div className="chat-panel" onPaste={onPaste}>
       <ol className="chat-log" ref={listRef} role="log" aria-label="Lịch sử trò chuyện" aria-live="polite" aria-relevant="additions" aria-busy={loading}>
         {messages.length === 0 && (
           <li className="chat-welcome">
@@ -387,7 +397,7 @@ function ChatPanel({ messages, loading, onSend, open }) {
                 <img src={STATUS_CARDS[m.status].art} alt="" />
                 <figcaption>
                   {STATUS_CARDS[m.status].text}
-                  {m.wait && <small>Khoảng {m.wait} giây nữa em quay lại.</small>}
+                  {m.wait > 0 && <small>Khoảng {m.wait} giây nữa em quay lại.</small>}
                 </figcaption>
               </figure>
             )}

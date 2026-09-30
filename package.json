@@ -4,8 +4,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "guard-server": "python3 server/app.py",
-    "redteam": "python3 server/redteam.py"
+    "guard-server": "server/.venv/bin/python server/app.py"
   },
   "dependencies": {
     "@react-three/drei": "^10.7.9",

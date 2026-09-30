@@ -1,0 +1,19 @@
+# Input rail: a blocked message stops here; app.py turns $input_block into the refusal text
+# (in the user's language), so the canned bot message below is never shown.
+define subflow check user message
+  $input_block = execute check_input(text=$user_message)
+  if $input_block
+    bot refuse
+    stop
+
+# Output rail: legal advice replaces the whole reply (fail closed); otherwise links the user
+# did not send, markdown images and secrets are stripped from it.
+define subflow check bot message
+  $output_block = execute check_output(text=$bot_message)
+  if $output_block
+    bot refuse
+    stop
+  $bot_message = execute clean_output(text=$bot_message)
+
+define bot refuse
+  "BLOCKED"

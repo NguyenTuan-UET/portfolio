@@ -1,10 +1,10 @@
 """
-Shared guardrail layers for Email Guard — adapted from the Day 11 lab
+Guardrail layers for the portfolio chatbot — adapted from the Day 11 lab
 (K4-L3A-Day11-Guardrails-HITL-Responsible-AI).
 
-  Rate Limiter → Input Guardrail → (doc_guard: scanner / output / actions) → Audit / Monitoring
+  Rate Limiter → Input Guardrail → LLM → Output Guardrail → Audit / Monitoring
 
-Every layer is plain Python (no framework) so the server has zero dependencies.
+Every check is plain Python; rails.py wires the content checks into NeMo Guardrails.
 Decisions are explicit strings ("ALLOW" / "BLOCK"), never ambiguous booleans.
 """
 from __future__ import annotations
@@ -189,7 +189,7 @@ def restricted_topic(user_input: str) -> str | None:
 
 
 # ============================================================
-# Layer 3 — Secret patterns (used by the output guardrail in doc_guard)
+# Layer 3 — Output guardrail: secrets, links, markdown images
 # ============================================================
 
 # Emails / phones in the user's own document are fine to echo back; secrets are not
@@ -198,6 +198,33 @@ SECRET_PATTERNS = {
     "password": r"\b(?:password|passwd|pwd|mật\s*khẩu)\s*(?:is|là|[:=])\s*[\"'`]?[^\s\"'`,;]+",
     "internal_host": r"\b[\w.-]+\.internal(?::\d+)?\b",
 }
+
+
+# Backticks / asterisks are markdown wrappers the model adds around links, never part of the URL
+URL_PATTERN = re.compile(r"https?://[^\s<>\"')\]`*]+", re.IGNORECASE)
+
+
+def clean_text(text: str, allowed_urls: set[str], issues: list[str]) -> str:
+    """Strip exfiltration channels and secrets from model text; append what was fixed to issues."""
+    # Markdown images are the classic zero-click exfiltration channel
+    text, n = re.subn(r"!\[[^\]]*\]\([^)]*\)", "[image removed]", text)
+    if n:
+        issues.append(f"{n} markdown image(s) removed")
+
+    def _url(m: re.Match) -> str:
+        url = m.group(0).rstrip(".,;:!?")
+        # A shortened copy of a link the user sent cannot carry extra data out, so it is safe to keep
+        if url in allowed_urls or any(src.startswith(url) for src in allowed_urls):
+            return m.group(0)
+        issues.append(f"link not from user removed: {url[:80]}")
+        return "[link removed]"
+
+    text = URL_PATTERN.sub(_url, text)
+    for kind, pattern in SECRET_PATTERNS.items():
+        text, n = re.subn(pattern, "[REDACTED]", text, flags=re.IGNORECASE)
+        if n:
+            issues.append(f"{kind} redacted")
+    return text
 
 
 # ============================================================

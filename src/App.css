@@ -519,6 +519,19 @@ button.link {
   }
 }
 
+/* Home có canvas 3D (Lanyard) nặng để dọn (Three.js/Rapier); unmount đột ngột khi rời trang hay bị
+   lóe sáng một khung hình do canvas gỡ ra giữa lúc còn đang render. Nên mờ dần trang cũ về opacity 0
+   TRƯỚC (Layout.jsx giữ nguyên nội dung cũ trong lúc này), chỉ unmount thật sự sau khi đã vô hình. */
+.route-fade-inner {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  animation: route-fade-in 0.45s ease-out;
+  transition: opacity 0.2s ease;
+}
+
+
 /* trang ngắn hơn màn hình thì route-fade giãn ra để footer luôn nằm ở cuối viewport */
 .route-fade {
   flex: 1;

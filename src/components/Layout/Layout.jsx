@@ -1,5 +1,6 @@
 import { useEffect } from "react"
 import { NavLink, Outlet, useLocation } from "react-router-dom"
+import Chat from "../../pages/Chat/Chat"
 import { CONTACTS, cvFile } from "../../data/profile"
 
 // thời gian cuộn lên đầu khi đổi trang, tăng số này nếu muốn cuộn chậm hơn
@@ -33,7 +34,6 @@ function scrollToTop(duration) {
 const NAV_LINKS = [
   { to: "/", label: "HOME" },
   { to: "/about", label: "ABOUT" },
-  { to: "/chat", label: "CHAT" },
 ]
 
 export default function Layout() {
@@ -79,6 +79,8 @@ export default function Layout() {
           ))}
         </div>
       </footer>
+
+      <Chat />
     </div>
   )
 }

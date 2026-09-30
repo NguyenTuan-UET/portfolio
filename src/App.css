@@ -520,54 +520,101 @@ button.link {
   }
 }
 
-/* ---------- trang chat: cùng tông nền xanh đậm với các trang khác ---------- */
-.chat-page {
+/* The assistant lives outside the route transition so navigation preserves it. */
+.chat-widget {
+  position: fixed;
+  z-index: 1000;
+  right: max(24px, env(safe-area-inset-right));
+  bottom: max(24px, env(safe-area-inset-bottom));
   display: flex;
   flex-direction: column;
-  gap: 32px;
-  max-width: 760px;
-  width: 100%;
-  margin: 0 auto;
-  padding: 96px 40px;
-  border-top: 1px dashed var(--line);
-  background: linear-gradient(180deg, var(--blue-dark) 0%, #051a5c 100%);
+  align-items: flex-end;
+  gap: 12px;
+  pointer-events: none;
 }
+
+.chat-widget > * { pointer-events: auto; }
+
+.chat-popup {
+  display: flex;
+  flex-direction: column;
+  width: min(390px, calc(100vw - 32px));
+  height: min(570px, calc(100dvh - 120px));
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  background: #071d60;
+  box-shadow: 0 20px 65px rgba(0, 0, 0, 0.4);
+}
+
+.chat-popup[hidden] { display: none; }
 
 .chat-head {
   display: flex;
-  flex-direction: column;
-  gap: 16px;
+  align-items: center;
+  gap: 12px;
+  padding: 16px;
+  border-bottom: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.05);
 }
 
-.chat-head h2 {
-  font-size: clamp(28px, 4vw, 40px);
-  font-weight: 600;
-  letter-spacing: -0.03em;
-  line-height: 1.1;
+.chat-avatar {
+  width: 42px;
+  height: 42px;
+  object-fit: cover;
+  border-radius: 50%;
 }
 
-.chat-head p {
-  font-size: 16px;
-  line-height: 1.6;
-  color: var(--muted);
-  max-width: 520px;
+.chat-head h2 { font-size: 16px; line-height: 1.4; }
+.chat-head p { font-size: 12px; color: var(--muted); margin-top: 3px; }
+
+.chat-minimize {
+  margin-left: auto;
+  width: 40px;
+  height: 40px;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  color: var(--fg);
+  background: transparent;
+  font-size: 24px;
+  cursor: pointer;
 }
+
+.chat-launcher {
+  position: relative;
+  width: 62px;
+  height: 62px;
+  padding: 3px;
+  border: 1px solid rgba(255, 255, 255, 0.6);
+  border-radius: 50%;
+  background: #8bb2c5;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
+  cursor: pointer;
+  transition: transform 0.2s;
+}
+
+.chat-launcher:hover { transform: translateY(-3px); }
+.chat-launcher img { display: block; width: 100%; height: 100%; object-fit: cover; border-radius: 50%; }
+.chat-status { position: absolute; right: 2px; bottom: 2px; width: 13px; height: 13px; border: 2px solid #071d60; border-radius: 50%; background: #7ce7b0; }
+.chat-widget :focus-visible { outline: 2px solid #9fc4ff; outline-offset: -3px; }
 
 .chat-panel {
   display: flex;
   flex-direction: column;
   flex: 1;
-  min-height: 480px;
+  min-height: 0;
   background: rgba(255, 255, 255, 0.04);
-  border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: 0;
+  border: none;
   overflow: hidden;
 }
 
 .chat-log {
   flex: 1;
   list-style: none;
-  padding: 24px 28px;
+  padding: 16px;
+  min-height: 0;
+  overscroll-behavior: contain;
   display: flex;
   flex-direction: column;
   gap: 14px;
@@ -650,7 +697,8 @@ button.link {
 
 .chat-suggest {
   list-style: none;
-  padding: 0 28px 16px;
+  padding: 0 16px 12px;
+  flex-shrink: 0;
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
@@ -674,6 +722,7 @@ button.link {
 }
 
 .chat-form {
+  flex-shrink: 0;
   display: flex;
   align-items: center;
   border-top: 1px solid var(--line);
@@ -682,9 +731,9 @@ button.link {
 .chat-form input {
   flex: 1;
   min-width: 0;
-  padding: 15px 18px;
+  padding: 15px 8px;
   font: inherit;
-  font-size: 15px;
+  font-size: 16px;
   color: var(--fg);
   background: transparent;
   border: none;
@@ -720,7 +769,7 @@ button.link {
 }
 
 .chat-attach-btn {
-  padding: 0 16px;
+  padding: 0 12px;
   font-size: 17px;
   color: var(--fg);
   background: transparent;
@@ -789,24 +838,23 @@ button.link {
   color: #ff6a57;
 }
 
-@media (max-width: 860px) {
-  .chat-page {
-    padding: 44px 20px 64px;
+@media (max-width: 480px) {
+  .chat-widget {
+    right: max(16px, env(safe-area-inset-right));
+    bottom: max(16px, env(safe-area-inset-bottom));
   }
-
-  .chat-panel {
-    min-height: 420px;
-  }
-
-  .chat-log {
-    padding: 18px;
-  }
-
-  .chat-suggest {
-    padding: 0 18px 14px;
-  }
+  .chat-popup { height: min(540px, calc(100dvh - 108px)); }
+  .chat-launcher { width: 56px; height: 56px; }
 }
 
+@media (max-height: 500px) {
+  .chat-suggest { display: none; }
+  .chat-head { padding: 8px 12px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chat-launcher { transition: none; }
+}
 
 /* trang ngắn hơn màn hình thì route-fade giãn ra để footer luôn nằm ở cuối viewport */
 .route-fade {

@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState } from "react"
+import { useLocation, useNavigate } from "react-router-dom"
+import chatAvatar from "../../assets/chat-avatar.png"
 
 const LAYER_NAME = {
   rate_limiter: "Giới hạn tốc độ",
@@ -43,6 +45,29 @@ const newSessionId = () =>
   globalThis.crypto?.randomUUID?.() ?? `s-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
 
 export default function Chat() {
+  const [open, setOpen] = useState(false)
+  const launcherRef = useRef(null)
+  const popupRef = useRef(null)
+  const location = useLocation()
+  const navigate = useNavigate()
+
+  // Keep legacy /chat links useful without retaining a separate chat page.
+  useEffect(() => {
+    if (!location.state?.openChat) return
+    setOpen(true)
+    const { openChat, ...rest } = location.state
+    navigate(`${location.pathname}${location.search}${location.hash}`, { replace: true, state: rest })
+  }, [location, navigate])
+
+  useEffect(() => {
+    if (open) popupRef.current?.querySelector('input[aria-label="Tin nhắn"]')?.focus({ preventScroll: true })
+  }, [open])
+
+  function minimize() {
+    setOpen(false)
+    launcherRef.current?.focus({ preventScroll: true })
+  }
+
   const [sessionId] = useState(newSessionId)
   const [messages, setMessages] = useState([])
   const [loading, setLoading] = useState(false)
@@ -63,29 +88,55 @@ export default function Chat() {
       const data = await res.json()
       push({ role: "bot", text: data.reply, blocked: data.blocked, redacted: data.redacted, layer: data.layer })
     } catch {
-      push({ role: "bot", text: "Không kết nối được tới server. Hãy chạy: npm run guard-server", blocked: true, layer: "network" })
+      push({ role: "bot", text: "Hiện chưa kết nối được với trợ lý. Bạn thử lại sau nhé.", blocked: true, layer: "network" })
     } finally {
       setLoading(false)
     }
   }
 
   return (
-    <section className="chat-page">
-      <header className="chat-head">
-        <span className="label">AI CHATBOT</span>
-        <h2>Hỏi đáp</h2>
-        <p>
-          Trò chuyện với mình bằng chữ hoặc đính kèm một ảnh để hỏi về nó. Ảnh chỉ được gửi thẳng cho mô hình, không
-          lưu trên server.
-        </p>
-      </header>
-
-      <ChatPanel messages={messages} loading={loading} onSend={send} />
-    </section>
+    <aside className="chat-widget" aria-label="Trợ lý trò chuyện">
+      <section
+        id="chat-popup"
+        className="chat-popup"
+        role="dialog"
+        aria-labelledby="chat-title"
+        hidden={!open}
+        ref={popupRef}
+        onKeyDown={(event) => {
+          if (event.key === "Escape") {
+            event.stopPropagation()
+            minimize()
+          }
+        }}
+      >
+        <header className="chat-head">
+          <img src={chatAvatar} alt="" className="chat-avatar" />
+          <div>
+            <h2 id="chat-title">Trợ lý của bạn</h2>
+            <p>Hỏi mình điều gì nhé</p>
+          </div>
+          <button type="button" className="chat-minimize" onClick={minimize} aria-label="Thu nhỏ trò chuyện" title="Thu nhỏ">−</button>
+        </header>
+        <ChatPanel messages={messages} loading={loading} onSend={send} open={open} />
+      </section>
+      <button
+        type="button"
+        className="chat-launcher"
+        ref={launcherRef}
+        aria-label={open ? "Thu nhỏ trò chuyện" : "Mở trợ lý trò chuyện"}
+        aria-expanded={open}
+        aria-controls="chat-popup"
+        onClick={() => open ? minimize() : setOpen(true)}
+      >
+        <img src={chatAvatar} alt="" />
+        <span className="chat-status" aria-hidden="true" />
+      </button>
+    </aside>
   )
 }
 
-function ChatPanel({ messages, loading, onSend }) {
+function ChatPanel({ messages, loading, onSend, open }) {
   const [input, setInput] = useState("")
   const [image, setImage] = useState(null) // { dataUrl, base64 } — chỉ ở trong state trình duyệt
   const [imageError, setImageError] = useState("")
@@ -94,9 +145,10 @@ function ChatPanel({ messages, loading, onSend }) {
 
   useEffect(() => {
     listRef.current?.scrollTo({ top: listRef.current.scrollHeight, behavior: "smooth" })
-  }, [messages, loading])
+  }, [messages, loading, open])
 
   function submit(msg) {
+    if (loading || (!msg.trim() && !image)) return
     onSend(msg, image)
     setInput("")
     setImage(null)
@@ -120,7 +172,7 @@ function ChatPanel({ messages, loading, onSend }) {
 
   return (
     <div className="chat-panel">
-      <ol className="chat-log" ref={listRef}>
+      <ol className="chat-log" ref={listRef} role="log" aria-label="Lịch sử trò chuyện" aria-live="polite" aria-relevant="additions" aria-busy={loading}>
         <li className="bot">
           <p>
             Chào bạn, mình là Guard Bot. Hỏi mình bất cứ điều gì — công nghệ, học tập, công việc, an toàn trên mạng —
